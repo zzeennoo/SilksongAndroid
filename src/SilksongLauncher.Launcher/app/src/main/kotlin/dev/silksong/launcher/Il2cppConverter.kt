@@ -334,7 +334,26 @@ object Il2cppConverter {
             cppDir(root).mkdirs()
             dataDir(root).mkdirs()
 
-            LauncherLog.log("il2cpp: starting with $budget; ${MonoRuntime.memory(context)}")
+            // The minimum budget is where sub-4 GB devices land. Converting
+            // each assembly separately is slower and produces a few more C++
+            // files, but it avoids keeping the whole game's conversion state
+            // live at once -- the trade a 3 GB device needs to survive LMKD.
+            //
+            // Ask for the worker count explicitly too. DOTNET_PROCESSOR_COUNT
+            // already constrains the runtime, but spelling it out keeps
+            // il2cpp from creating more conversion workers than the budget.
+            val lowMemoryMode = budget.heapMb > 0 && budget.tighter() == null
+            val attemptArgv = ArrayList(argv).apply {
+                add("--jobs=${budget.cores}")
+                if (lowMemoryMode) {
+                    add("--conversion-mode=PartialPerAssemblyInProcess")
+                }
+            }
+            LauncherLog.log(
+                "il2cpp: starting with $budget; mode=" +
+                    (if (lowMemoryMode) "partial-per-assembly" else "whole-program") +
+                    "; ${MonoRuntime.memory(context)}",
+            )
             send(Progress("Converting to C++", 0f, "0 of $expected files"))
             val sink = log.bufferedWriter()
             // Real progress, counted off the output directory.
@@ -371,7 +390,7 @@ object Il2cppConverter {
                 MonoRuntime.exec(
                     context,
                     File(deploy, "il2cpp.dll"),
-                    argv,
+                    attemptArgv,
                     // il2cpp resolves parts of its own installation relative to
                     // the working directory.
                     cwd = deploy,
@@ -646,3 +665,4 @@ object Il2cppConverter {
         marker.writeText("")
     }
 }
+
