@@ -271,7 +271,7 @@ To the on-device compile:
 | | |
 | --- | --- |
 | `OPT=-Os` | optimise for size instead of speed (default `-O2`) |
-| `JOBS=n` | compile parallelism (default: core count) |
+| `BUILD_JOBS=n` | compile parallelism (default: core count capped by free memory) |
 | `FULL=1` | rebuild every translation unit |
 
 ## Logs
@@ -280,9 +280,12 @@ On the device, under `/sdcard/Android/data/<pkg>/files/build/`:
 
 | | |
 | --- | --- |
-| `compile.log` | per-phase progress and timings |
+| `compile.log` | all native compile attempts, with per-phase progress and timings |
 | `err.log` | compiler diagnostics |
-| `convert.log` | IL2CPP conversion |
+| `convert.log` | all IL2CPP attempts, appended rather than overwritten |
+| `convert-memory.log` | converter RSS and system free-memory samples |
+| `conversion.inflight` | last durable conversion checkpoint; removed after a handled exit |
+| `conversion.profile` | budget that produced the complete C++ tree |
 | `inputsystem.log` | the Input System compile |
 
 `obj/` is mode 700, so counting objects needs `adb shell run-as <pkg> ls ...`

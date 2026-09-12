@@ -77,6 +77,12 @@ fi
 # tier the conversion had to fall back to, for one -- and a terminal run is
 # often deliberately throttled to keep the phone usable.
 JOBS="${BUILD_JOBS:-$JOBS}"
+case "$JOBS" in
+    ''|*[!0-9]*|0)
+        echo "### invalid BUILD_JOBS: $JOBS" >&2
+        exit 1
+        ;;
+esac
 
 # --sysroot points at the NDK (not Termux's) so the produced .so depends only
 # on bionic: liblog/libm/libdl/libc, exactly like Unity's own libil2cpp.so.
@@ -154,6 +160,9 @@ if [ "${FULL:-0}" = 1 ] || [ ! -f "$FLAGSIG" ] || [ "$(cat "$FLAGSIG")" != "$sig
     printf '%s' "$sig" > "$FLAGSIG"
 fi
 [ -f "$MANIFEST" ] || : > "$MANIFEST"
+# A process killed in clang leaves only temporary outputs now. They are never
+# valid checkpoints and can be very large, so reclaim them before resuming.
+rm -f obj/*.part obj/*.part.*
 
 # Object names derive from the FULL path, not the basename: libil2cpp has 360
 # sources but only 247 distinct basenames (os/Posix/Thread.cpp vs
@@ -186,8 +195,19 @@ cat > obj/.cc <<'WORKER'
 f="$1"
 rel="${f#$CC_TREE/}"
 out=$(printf 'obj/%s%s.o' "$CC_PREFIX" "$(echo "$rel" | tr -c 'A-Za-z0-9._-' '_')")
-exec $CLANG -x "$CC_LANG" -std="$CC_STD" $CC_PCH $CXXFLAGS $DEF $INC $TGT \
-     -c "$f" -o "$out" 2>>err.log
+hash=$(sha256sum "$f" | cut -d' ' -f1)
+part="$out.part.$$"
+stamp="$out.sha256"
+stamp_part="$stamp.part.$$"
+rm -f "$part" "$stamp_part"
+if ! $CLANG -x "$CC_LANG" -std="$CC_STD" $CC_PCH $CXXFLAGS $DEF $INC $TGT \
+     -c "$f" -o "$part" 2>>err.log; then
+    rm -f "$part" "$stamp_part"
+    exit 1
+fi
+mv -f "$part" "$out" || exit 1
+printf '%s' "$hash" > "$stamp_part" || exit 1
+mv -f "$stamp_part" "$stamp" || exit 1
 WORKER
 chmod +x obj/.cc
 export CLANG CXXFLAGS DEF INC TGT
@@ -213,9 +233,15 @@ build_pch() {
     # Rebuilt when the header is newer, so a re-fetched or updated Unity does
     # not leave a stale one behind. A flag change is already covered: that
     # wipes obj/ wholesale via the signature check above, and the PCH with it.
-    [ -f "$out" ] && [ ! "$hdr" -nt "$out" ] && return 0
-    $CLANG -x "$lang-header" -std="$std" $CXXFLAGS $DEF $INC $TGT \
-        -o "$out" "$hdr" 2>>err.log
+    [ -s "$out" ] && [ ! "$hdr" -nt "$out" ] && return 0
+    part="$out.part"
+    rm -f "$part"
+    if ! $CLANG -x "$lang-header" -std="$std" $CXXFLAGS $DEF $INC $TGT \
+        -o "$part" "$hdr" 2>>err.log; then
+        rm -f "$part"
+        return 1
+    fi
+    mv -f "$part" "$out"
 }
 
 pch_for() {
@@ -253,8 +279,16 @@ compile_all() {
     while read -r hash f; do
         out=$(obj_name "$prefix" "$f" "$tree")
         echo "$out" >> obj/.objs
+        stamp="$out.sha256"
+        saved=$([ -f "$stamp" ] && cat "$stamp")
+        if [ -s "$out" ] && [ "$saved" = "$hash" ]; then
+            continue
+        fi
         old=$(grep -F "  $f" "$MANIFEST" 2>/dev/null | head -1 | cut -d' ' -f1)
-        if [ -f "$out" ] && [ "$old" = "$hash" ]; then
+        if [ -s "$out" ] && [ "$old" = "$hash" ]; then
+            # One-time migration from the old end-of-build manifest. Future
+            # runs trust the sidecar written atomically with this object.
+            printf '%s' "$hash" > "$stamp.part" && mv -f "$stamp.part" "$stamp"
             continue
         fi
         printf '%s\n' "$f" >> obj/.todo
@@ -292,6 +326,7 @@ compile_all() {
         # and working.
         CC_LANG="$lang" CC_STD="$std" CC_PREFIX="$prefix" CC_PCH="$pch" CC_TREE="$tree" \
             xargs -P "$JOBS" -n 1 sh obj/.cc < obj/.todo
+        pool_status=$?
 
         # Every unit must have produced an object, and this is checked rather
         # than assumed. The link allows undefined symbols, so a phase that
@@ -302,10 +337,13 @@ compile_all() {
         # trouble was the game crashing on launch.
         failed=0
         while read -r f; do
-            [ -f "$(obj_name "$prefix" "$f" "$tree")" ] || failed=$((failed + 1))
+            out=$(obj_name "$prefix" "$f" "$tree")
+            expected=$(sha256sum "$f" | cut -d' ' -f1)
+            saved=$([ -f "$out.sha256" ] && cat "$out.sha256")
+            [ -s "$out" ] && [ "$saved" = "$expected" ] || failed=$((failed + 1))
         done < obj/.todo
-        if [ "$failed" -gt 0 ]; then
-            echo "### FAILED: $failed of $built translation units produced no object" >&2
+        if [ "$pool_status" -ne 0 ] || [ "$failed" -gt 0 ]; then
+            echo "### FAILED: compile pool exit $pool_status; $failed of $built translation units produced no current object" >&2
             grep -m 5 'error:' err.log >&2
             exit 1
         fi
@@ -355,32 +393,55 @@ echo "### PHASE C2: compiling bdwgc (amalgamated)"
 # C2-C4 are vendored sources that never change between iterations, so an
 # existing object is always current -- a flag change wipes obj/ wholesale via
 # the signature check above.
-if [ ! -f obj/zgc_amalgam.o ]; then
-$CLANG -x c -std=gnu99 -march=armv8-a $OPT -fPIC -fvisibility=hidden \
-       -Wno-implicit-function-declaration $GCDEF \
-       -I"$EXTERNAL/bdwgc/include" -I"$EXTERNAL/bdwgc/libatomic_ops/src" \
-       $TGT -c "$EXTERNAL/bdwgc/extra/gc.c" -o obj/zgc_amalgam.o 2>>err.log
+if [ ! -s obj/zgc_amalgam.o ]; then
+    rm -f obj/zgc_amalgam.o.part
+    if ! $CLANG -x c -std=gnu99 -march=armv8-a $OPT -fPIC -fvisibility=hidden \
+           -Wno-implicit-function-declaration $GCDEF \
+           -I"$EXTERNAL/bdwgc/include" -I"$EXTERNAL/bdwgc/libatomic_ops/src" \
+           $TGT -c "$EXTERNAL/bdwgc/extra/gc.c" -o obj/zgc_amalgam.o.part 2>>err.log; then
+        rm -f obj/zgc_amalgam.o.part
+        exit 1
+    fi
+    mv -f obj/zgc_amalgam.o.part obj/zgc_amalgam.o || exit 1
 fi
-echo "  $([ -f obj/zgc_amalgam.o ] && echo OK || echo FAILED)  $(( $(date +%s)-T2b ))s"
+echo "  $([ -s obj/zgc_amalgam.o ] && echo OK || echo FAILED)  $(( $(date +%s)-T2b ))s"
 
 # zlib. Unity renames every symbol to il2cpp_z_* via Z_PREFIX in zconf.h, so
 # the runtime's calls only resolve against a Z_PREFIX build of these sources.
 T2c=$(date +%s)
 echo "### PHASE C3: compiling zlib ($(ls "$EXTERNAL"/zlib/*.c | wc -l) TUs)"
 n=0
+zlib_pids=""
 for f in "$EXTERNAL"/zlib/*.c; do
     out="obj/zl_$(basename "$f").o"
-    [ -f "$out" ] && continue
-    $CLANG -x c -std=gnu99 -march=armv8-a $OPT -fPIC -fvisibility=hidden \
-           -DZ_PREFIX -DHAVE_HIDDEN -DNDEBUG -DANDROID \
-           -I"$EXTERNAL/zlib" $TGT -c "$f" -o "$out" 2>>err.log &
+    [ -s "$out" ] && continue
+    (
+        part="$out.part"
+        rm -f "$part"
+        $CLANG -x c -std=gnu99 -march=armv8-a $OPT -fPIC -fvisibility=hidden \
+               -DZ_PREFIX -DHAVE_HIDDEN -DNDEBUG -DANDROID \
+               -I"$EXTERNAL/zlib" $TGT -c "$f" -o "$part" 2>>err.log &&
+            mv -f "$part" "$out"
+        status=$?
+        [ "$status" -eq 0 ] || rm -f "$part"
+        exit "$status"
+    ) &
+    zlib_pids="$zlib_pids $!"
     # Bounded like every other phase. These are small and there are only a
     # dozen of them, so this is never the phase that runs a device out of
     # memory -- but a build that has been throttled to one compile at a time
     # has been throttled for a reason, and starting twelve here ignores it.
-    n=$((n+1)); [ $((n % JOBS)) -eq 0 ] && wait
+    n=$((n+1))
+    if [ $((n % JOBS)) -eq 0 ]; then
+        zlib_status=0
+        for pid in $zlib_pids; do wait "$pid" || zlib_status=1; done
+        [ "$zlib_status" -eq 0 ] || exit 1
+        zlib_pids=""
+    fi
 done
-wait
+zlib_status=0
+for pid in $zlib_pids; do wait "$pid" || zlib_status=1; done
+[ "$zlib_status" -eq 0 ] || exit 1
 echo "  objects: $(ls obj/zl_*.o 2>/dev/null | wc -l)  $(( $(date +%s)-T2c ))s"
 
 # brotli. Its headers include il2cpp-config.h, so libil2cpp has to be on the
@@ -390,15 +451,33 @@ BR="$LIBIL2CPP/os/ClassLibraryPAL/brotli"
 T2d=$(date +%s)
 echo "### PHASE C4: compiling brotli ($(find -L "$BR" -name '*.c' | wc -l) TUs)"
 n=0
+brotli_pids=""
 for f in $(find -L "$BR" -name '*.c'); do
     out="obj/br_$(echo "$f" | tr -c 'A-Za-z0-9._-' '_').o"
-    [ -f "$out" ] && continue
-    $CLANG -x c -std=gnu99 -march=armv8-a $OPT -fPIC -fvisibility=hidden \
-           -DNDEBUG -DANDROID -I"$BR/include" -I"$LIBIL2CPP" -I"$BR" \
-           $TGT -c "$f" -o "$out" 2>>err.log &
-    n=$((n+1)); [ $((n % JOBS)) -eq 0 ] && wait
+    [ -s "$out" ] && continue
+    (
+        part="$out.part"
+        rm -f "$part"
+        $CLANG -x c -std=gnu99 -march=armv8-a $OPT -fPIC -fvisibility=hidden \
+               -DNDEBUG -DANDROID -I"$BR/include" -I"$LIBIL2CPP" -I"$BR" \
+               $TGT -c "$f" -o "$part" 2>>err.log &&
+            mv -f "$part" "$out"
+        status=$?
+        [ "$status" -eq 0 ] || rm -f "$part"
+        exit "$status"
+    ) &
+    brotli_pids="$brotli_pids $!"
+    n=$((n+1))
+    if [ $((n % JOBS)) -eq 0 ]; then
+        brotli_status=0
+        for pid in $brotli_pids; do wait "$pid" || brotli_status=1; done
+        [ "$brotli_status" -eq 0 ] || exit 1
+        brotli_pids=""
+    fi
 done
-wait
+brotli_status=0
+for pid in $brotli_pids; do wait "$pid" || brotli_status=1; done
+[ "$brotli_status" -eq 0 ] || exit 1
 echo "  objects: $(ls obj/br_*.o 2>/dev/null | wc -l)  $(( $(date +%s)-T2d ))s"
 
 # Objects whose source has disappeared must go, or the link silently keeps
@@ -408,13 +487,13 @@ stale=0
 for o in obj/g*.o obj/c*.o obj/r*.o; do
     [ -f "$o" ] || continue
     case "$o" in obj/zgc_*|obj/zl_*) continue ;; esac
-    grep -q "^$o\$" obj/.objs 2>/dev/null || { rm -f "$o"; stale=$((stale+1)); }
+    grep -q "^$o\$" obj/.objs 2>/dev/null || { rm -f "$o" "$o.sha256"; stale=$((stale+1)); }
 done
 [ "$stale" -gt 0 ] && echo "### pruned $stale stale object(s)"
 
-# Record what was built so the next run can skip it. Written only after every
-# phase has succeeded, so an interrupted build re-does its work rather than
-# trusting a half-written manifest.
+# Record a complete-tree manifest for compatibility and pruning. Individual
+# object sidecars above are the crash-safe resume record: each appears only
+# after its object has compiled and been moved into place successfully.
 mv obj/.seen "$MANIFEST"
 rm -f obj/.now obj/.objs
 
@@ -483,11 +562,12 @@ echo "### PHASE D: linking libil2cpp.so"
 # It is compatible with --allow-shlib-undefined below: that one is about
 # unresolved references inside the shared libraries being linked AGAINST, this
 # one is about symbols nothing on the link line defines at all.
+rm -f "$ROOT/libil2cpp.so.part"
 "$USR/bin/clang++" $TGT -shared -fPIC -fuse-ld=lld -nostdlib++ \
     -Wl,-soname,libil2cpp.so \
     -Wl,-z,max-page-size=16384 \
     -Wl,--no-undefined \
-    -o "$ROOT/libil2cpp.so" obj/*.o "$BASELIB" \
+    -o "$ROOT/libil2cpp.so.part" obj/*.o "$BASELIB" \
     -lc++_static -lc++abi -llog -lm -ldl -lc \
     -Wl,--allow-shlib-undefined >>err.log 2>&1
 link_status=$?
@@ -497,13 +577,15 @@ echo "### RESULT"
 if [ "$link_status" -ne 0 ]; then
     echo "### LINK FAILED (exit $link_status)" >&2
     tail -20 err.log >&2
-    rm -f "$ROOT/libil2cpp.so"
+    rm -f "$ROOT/libil2cpp.so.part"
     exit 1
 fi
-if [ ! -f "$ROOT/libil2cpp.so" ]; then
+if [ ! -s "$ROOT/libil2cpp.so.part" ]; then
     echo "### LINK PRODUCED NOTHING" >&2
     tail -20 err.log >&2
+    rm -f "$ROOT/libil2cpp.so.part"
     exit 1
 fi
+mv -f "$ROOT/libil2cpp.so.part" "$ROOT/libil2cpp.so" || exit 1
 ls -la "$ROOT/libil2cpp.so"
 echo "total build time: $(( $(date +%s)-T0 ))s"

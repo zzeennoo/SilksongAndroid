@@ -35,6 +35,7 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
 
 object Il2cppConverter {
@@ -74,6 +75,80 @@ object Il2cppConverter {
      * directory before il2cpp starts, which is exactly when this is needed.
      */
     private fun sourceCount(root: File) = File(root, "cpp.count")
+
+    /**
+     * A durable note that a conversion was in flight.
+     *
+     * The launcher process can be reclaimed before it sees the builder's exit
+     * reason. Keeping this beside the generated tree lets the next launch
+     * distinguish that from a fresh build and start one rung lower instead of
+     * repeating the same losing profile.
+     */
+    private fun attemptState(root: File) = File(root, "conversion.inflight")
+    private fun completedProfile(root: File) = File(root, "conversion.profile")
+    private fun memoryLog(root: File) = File(root, "convert-memory.log")
+
+    private data class SavedAttempt(
+        val budget: MonoRuntime.Budget,
+        val files: Int,
+        val started: Long,
+    )
+
+    private fun encodeBudget(budget: MonoRuntime.Budget): String =
+        "cores=${budget.cores}\nheapMb=${budget.heapMb}\n"
+
+    private fun readBudget(file: File): MonoRuntime.Budget? = runCatching {
+        val values = file.readLines().mapNotNull { line ->
+            val cut = line.indexOf('=')
+            if (cut <= 0) null else line.substring(0, cut) to line.substring(cut + 1)
+        }.toMap()
+        val cores = values["cores"]?.toIntOrNull()?.takeIf { it in 1..128 } ?: return@runCatching null
+        val heap = values["heapMb"]?.toIntOrNull()?.takeIf { it in 0..16_384 } ?: return@runCatching null
+        MonoRuntime.Budget(cores, heap)
+    }.getOrNull()
+
+    private fun readAttempt(root: File): SavedAttempt? {
+        val file = attemptState(root)
+        val budget = readBudget(file) ?: return null
+        val values = runCatching {
+            file.readLines().mapNotNull { line ->
+                val cut = line.indexOf('=')
+                if (cut <= 0) null else line.substring(0, cut) to line.substring(cut + 1)
+            }.toMap()
+        }.getOrNull() ?: return null
+        return SavedAttempt(
+            budget,
+            values["files"]?.toIntOrNull()?.coerceAtLeast(0) ?: 0,
+            values["started"]?.toLongOrNull()?.coerceAtLeast(0L) ?: 0L,
+        )
+    }
+
+    private fun markAttempt(root: File, budget: MonoRuntime.Budget, files: Int, started: Long) {
+        BuildInstallation.writeAtomic(
+            attemptState(root),
+            encodeBudget(budget) + "files=${files.coerceAtLeast(0)}\nstarted=$started\n",
+        )
+    }
+
+    private fun clearAttempt(root: File) {
+        val file = attemptState(root)
+        if (file.exists() && !file.delete()) {
+            LauncherLog.log("il2cpp: could not clear ${file.name}; the completed marker still prevents a false rebuild")
+        }
+    }
+
+    /** The profile that produced the complete source tree, for native compile throttling. */
+    fun completedBudget(root: File): MonoRuntime.Budget? =
+        if (isComplete(root)) readBudget(completedProfile(root)) else null
+
+    /** A recovered run may only keep or tighten the device's present limit. */
+    internal fun recoveryBudget(
+        device: MonoRuntime.Budget,
+        interrupted: MonoRuntime.Budget?,
+    ): MonoRuntime.Budget {
+        val next = interrupted?.tighter() ?: interrupted ?: return device
+        return device.constrainedBy(next)
+    }
 
     private fun expectedSources(root: File): Int =
         sourceCount(root).takeIf { it.isFile }?.readText()?.trim()?.toIntOrNull()
@@ -247,9 +322,14 @@ object Il2cppConverter {
         if (!engine.isDirectory) throw IOException("the Android player's Managed folder is missing: $engine")
         if (!File(deploy, "il2cpp.dll").isFile) throw IOException("il2cpp.dll is missing: $deploy")
 
+        val previousWasComplete = isComplete(root)
         if (doneMarker(root).exists() && !doneMarker(root).delete()) {
             throw IOException("Could not invalidate the previous conversion")
         }
+        // A complete marker wins over an in-flight marker left during the
+        // tiny hand-off window between writing completion and clearing the
+        // attempt. It describes a finished older run, not this rebuild.
+        if (previousWasComplete) clearAttempt(root)
         val modSnapshot = mods?.let { Mods.snapshot(it, assets) }
         var modReport = emptyList<Mods.Plugin>()
         send(Progress("Preparing the converter", -1f, "assemblies"))
@@ -312,14 +392,18 @@ object Il2cppConverter {
         val expected = expectedSources(root)
         val log = File(root, "convert.log")
         val started = System.currentTimeMillis()
+        val interrupted = if (previousWasComplete) null else readAttempt(root)
 
         // One attempt, and the machinery that makes it watchable.
         //
         // A function rather than a block because a conversion can be reclaimed
         // for memory and tried again smaller, and everything here has to be
-        // done afresh when it is: the output directory is emptied, the log is
-        // rewritten, and the progress counter starts from nothing.
+        // done afresh when it is: the output directory is emptied, a new
+        // section is appended to the log, and progress starts from nothing.
         suspend fun attempt(budget: MonoRuntime.Budget): Toolchain.Result {
+            val attemptStarted = System.currentTimeMillis()
+            runCatching { markAttempt(root, budget, 0, attemptStarted) }
+                .onFailure { LauncherLog.log("il2cpp: could not create the conversion checkpoint", it) }
             // Any previous attempt is cleared: il2cpp is not asked to reconcile
             // a half-written tree, and a stale .cpp left behind by an
             // interrupted run would be compiled into the result.
@@ -334,15 +418,15 @@ object Il2cppConverter {
             cppDir(root).mkdirs()
             dataDir(root).mkdirs()
 
-            // The minimum budget is where sub-4 GB devices land. Converting
+            // Every constrained budget uses the lower-peak mode. Converting
             // each assembly separately is slower and produces a few more C++
             // files, but it avoids keeping the whole game's conversion state
-            // live at once -- the trade a 3 GB device needs to survive LMKD.
+            // live at once -- the trade a device near LMKD needs to survive.
             //
             // Ask for the worker count explicitly too. DOTNET_PROCESSOR_COUNT
             // already constrains the runtime, but spelling it out keeps
             // il2cpp from creating more conversion workers than the budget.
-            val lowMemoryMode = budget.heapMb > 0 && budget.tighter() == null
+            val lowMemoryMode = budget.heapMb > 0
             val attemptArgv = ArrayList(argv).apply {
                 add("--jobs=${budget.cores}")
                 if (lowMemoryMode) {
@@ -355,7 +439,11 @@ object Il2cppConverter {
                     "; ${MonoRuntime.memory(context)}",
             )
             send(Progress("Converting to C++", 0f, "0 of $expected files"))
-            val sink = log.bufferedWriter()
+            val sink = FileOutputStream(log, true).bufferedWriter().apply {
+                write("\n=== ${java.util.Date(attemptStarted)}; $budget; " +
+                    (if (lowMemoryMode) "partial-per-assembly" else "whole-program") + " ===\n")
+                flush()
+            }
             // Real progress, counted off the output directory.
             //
             // il2cpp says nothing at all while it works: its stdout is block
@@ -371,9 +459,16 @@ object Il2cppConverter {
             // so the previous run's count is the denominator and the constant is
             // only ever used once.
             val ticker = launch(Dispatchers.IO) {
+                var lastCheckpoint = 0L
                 while (isActive) {
                     delay(PROGRESS_POLL_MS)
                     val n = cppDir(root).list()?.size ?: 0
+                    val now = System.currentTimeMillis()
+                    if (now - lastCheckpoint >= ATTEMPT_CHECKPOINT_MS) {
+                        lastCheckpoint = now
+                        runCatching { markAttempt(root, budget, n, attemptStarted) }
+                            .onFailure { LauncherLog.log("il2cpp: could not checkpoint conversion progress", it) }
+                    }
                     // Never quite full: the step is over when il2cpp says so, not
                     // when a guessed total is reached, and a bar that sits at 100%
                     // is a bar that has started lying.
@@ -386,6 +481,7 @@ object Il2cppConverter {
                     )
                 }
             }
+            var lastMemorySample = 0L
             return try {
                 MonoRuntime.exec(
                     context,
@@ -395,16 +491,37 @@ object Il2cppConverter {
                     // the working directory.
                     cwd = deploy,
                     env = budget.toEnv(),
-                ) { line ->
-                    sink.write(line); sink.write("\n")
-                }
+                    onMemorySample = { rssKb ->
+                        val now = System.currentTimeMillis()
+                        if (now - lastMemorySample >= MEMORY_LOG_MS) {
+                            lastMemorySample = now
+                            runCatching {
+                                memoryLog(root).appendText(
+                                    "$now; $budget; builder RSS ${rssKb / 1024} MB; " +
+                                        MonoRuntime.memory(context) + "\n",
+                                )
+                            }
+                        }
+                    },
+                    onLine = { line -> sink.write(line); sink.write("\n"); sink.flush() },
+                )
             } finally {
                 ticker.cancel()
                 sink.flush(); sink.close()
             }
         }
 
-        var budget = MonoRuntime.budget(context)
+        val deviceBudget = MonoRuntime.budget(context)
+        var budget = recoveryBudget(deviceBudget, interrupted?.budget)
+        if (interrupted != null) {
+            val ageSeconds = (System.currentTimeMillis() - interrupted.started)
+                .coerceAtLeast(0L) / 1000L
+            val age = if (interrupted.started > 0L) ", ${ageSeconds}s ago" else ""
+            LauncherLog.log(
+                "il2cpp: recovering an interrupted ${interrupted.budget} attempt " +
+                    "at ${interrupted.files} files$age; starting with $budget",
+            )
+        }
         var result = attempt(budget)
         // Reclaimed rather than failed: the settings were too generous for
         // this device as it stood, so the same work is offered a smaller share
@@ -421,6 +538,7 @@ object Il2cppConverter {
         val seconds = (System.currentTimeMillis() - started) / 1000
 
         if (!result.ok) {
+            clearAttempt(root)
             if (result.outOfMemory) {
                 throw IOException(
                     "il2cpp ran out of memory after ${seconds}s, at the smallest settings " +
@@ -435,6 +553,7 @@ object Il2cppConverter {
             throw IOException("il2cpp failed after ${seconds}s, exit ${result.code}: $why")
         }
         if (metadata(root).length() <= 0) {
+            clearAttempt(root)
             throw IOException("il2cpp produced no global-metadata.dat")
         }
 
@@ -451,11 +570,21 @@ object Il2cppConverter {
         // build reads as permission to skip the four minutes it took to get
         // here, so it has to mean the run reached this line.
         markComplete(root)
+        runCatching { BuildInstallation.writeAtomic(completedProfile(root), encodeBudget(budget)) }
+            .onFailure { LauncherLog.log("il2cpp: could not remember the successful build profile", it) }
+        // Kept until the completed marker is durable. If the launcher is
+        // reclaimed in the small validation window above, the next run still
+        // knows it did not observe a complete hand-off.
+        clearAttempt(root)
         LauncherLog.log(
             "il2cpp: ${seconds}s, $cpp cpp + $c c, metadata ${metadata(root).length()} bytes",
         )
         send(Progress("Converted", 1f, "$cpp C++ files in ${seconds}s"))
     }.flowOn(Dispatchers.IO)
+
+    /** Durable progress is intentionally much less frequent than UI polling. */
+    private const val ATTEMPT_CHECKPOINT_MS = 10_000L
+    private const val MEMORY_LOG_MS = 10_000L
 
     /**
      * The last thing il2cpp said, for a failure that said nothing error-shaped.
@@ -665,4 +794,3 @@ object Il2cppConverter {
         marker.writeText("")
     }
 }
-

@@ -31,6 +31,7 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
 
 object NativeBuild {
@@ -65,6 +66,7 @@ object NativeBuild {
         root: File,
         assets: android.content.res.AssetManager,
         install: File? = null,
+        budget: MonoRuntime.Budget? = null,
     ): Flow<Progress> =
         channelFlow {
             if (!Il2cppConverter.cppDir(root).isDirectory) {
@@ -124,7 +126,22 @@ object NativeBuild {
 
             val started = System.currentTimeMillis()
             val log = File(root, "compile.log")
-            val sink = log.bufferedWriter()
+            val sink = FileOutputStream(log, true).bufferedWriter().apply {
+                write("\n=== ${java.util.Date(started)} ===\n")
+                flush()
+            }
+            val buildLimits = budget?.let {
+                mapOf(
+                    "BUILD_JOBS" to it.cores.toString(),
+                    "OPT" to if (it.heapMb > 0) "-Os" else "-O2",
+                )
+            }.orEmpty()
+            if (budget != null) {
+                LauncherLog.log(
+                    "native build: ${budget.cores} compile job(s), " +
+                        (if (budget.heapMb > 0) "-Os safe profile" else "-O2 roomy profile"),
+                )
+            }
             val result = try {
                 Toolchain.exec(
                     listOf("/system/bin/sh", script.absolutePath),
@@ -132,7 +149,7 @@ object NativeBuild {
                     // ROOT is where the build's own output goes; the rest name
                     // the inputs, which live in other storage areas. See stage.
                     env = Toolchain.environment(toolchain) +
-                        mapOf("ROOT" to root.absolutePath) + pieces,
+                        mapOf("ROOT" to root.absolutePath) + pieces + buildLimits,
                 ) { line ->
                     // Flushed per line, not per buffer. The script emits only
                     // a couple of dozen lines over sixteen minutes, so this

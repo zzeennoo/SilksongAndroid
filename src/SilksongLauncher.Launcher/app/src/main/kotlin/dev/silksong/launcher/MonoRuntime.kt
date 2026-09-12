@@ -169,10 +169,26 @@ object MonoRuntime {
          * Unknown or malformed options are reported and ignored by SGen rather
          * than being fatal, so the worst a mistake here costs is the tuning.
          */
-        fun toEnv(): Map<String, String> = if (heapMb <= 0) emptyMap() else mapOf(
-            "DOTNET_PROCESSOR_COUNT" to cores.toString(),
-            "MONO_GC_PARAMS" to "major=marksweep,nursery-size=4m,soft-heap-limit=${heapMb}m",
-        )
+        fun toEnv(): Map<String, String> = buildMap {
+            put("DOTNET_PROCESSOR_COUNT", cores.toString())
+            if (heapMb > 0) {
+                put(
+                    "MONO_GC_PARAMS",
+                    "major=marksweep,nursery-size=1m,soft-heap-limit=${heapMb}m",
+                )
+            }
+        }
+
+        /** The stricter parts of two independently-derived limits. */
+        fun constrainedBy(other: Budget): Budget {
+            val heap = when {
+                heapMb <= 0 && other.heapMb <= 0 -> 0
+                heapMb <= 0 -> other.heapMb
+                other.heapMb <= 0 -> heapMb
+                else -> heapMb.coerceAtMost(other.heapMb)
+            }
+            return Budget(cores.coerceAtMost(other.cores), heap)
+        }
 
         /**
          * The next step down, for a run that has already been reclaimed once.
@@ -195,48 +211,67 @@ object MonoRuntime {
 
     /** Below this there is no point continuing to squeeze; il2cpp needs it. */
     private const val FLOOR_HEAP_MB = 384
+    private const val GIB = 1024L * 1024L * 1024L
 
     /**
-     * What this device gets, from what it has rather than what is free.
+     * What this device gets, from both its physical size and the room Android
+     * can actually offer at the start of this run.
      *
-     * Total memory rather than available: available is whatever the user
-     * happened to have open when the button was pressed, and a build that
-     * silently converts with two workers because a browser was in the
-     * background is a build whose duration nobody can explain. Total is a
-     * property of the phone, so the same phone always builds the same way.
+     * Total memory supplies the normal ceiling. Available memory supplies a
+     * second, stricter ceiling. The old total-only rule gave a 6.9 GiB phone
+     * four workers and a 1 GiB soft heap while Android reported only 1.7 GiB
+     * free; the converter then disappeared near the end twice. Repeatability
+     * is not useful when it repeats a setting the current machine cannot hold.
      *
      * The tiers are deliberately coarse and the top one is "change nothing":
      * every device this is known to work on is above it, and they should keep
      * the behaviour they were measured with.
      *
-     * The boundaries sit well inside each band rather than on it, because
-     * totalMem is not the number on the box. The kernel's own carveout comes
-     * off it first, and how much varies by a few percent between devices: a
-     * Retroid Pocket Flip 2 with 8 GB reports 7.52, and 4 GB devices report
-     * anywhere from about 3.4 to 3.9. A threshold placed at the nominal figure
-     * therefore splits a single class of device in two, and the half that
-     * falls through lands a whole tier below where it belongs -- a 4 GB phone
-     * would convert on one core because it happened to report 3.4 rather than
-     * 3.6. Each cut is made in the empty space between bands instead.
+     * The total-memory boundaries sit inside the gaps between nominal device
+     * classes, because the kernel's carveout means a marketed 8 GB device can
+     * report about 7.5 GiB and a marketed 4 GB device anywhere around 3.4 to
+     * 3.9 GiB. The available-memory boundary is deliberately conservative:
+     * it is the emergency brake for a large phone whose other processes have
+     * already consumed the room its nominal class suggests it has.
      */
     fun budget(context: Context): Budget {
         val cores = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
-        val total = runCatching {
+        val memory = runCatching {
             val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
             val mi = ActivityManager.MemoryInfo()
             am.getMemoryInfo(mi)
-            mi.totalMem
-        }.getOrDefault(0L)
-        val gb = total / 1024.0 / 1024.0 / 1024.0
-        return when {
-            // Unknown is treated as roomy: a device that will not answer the
-            // question is not evidence that it is small, and capping every
-            // such device would slow builds that were never in trouble.
-            total <= 0L || gb >= 7.0 -> Budget(cores, 0)
-            gb >= 5.2 -> Budget(cores.coerceAtMost(4), 1024)
-            gb >= 3.2 -> Budget(cores.coerceAtMost(2), 640)
+            Triple(mi.totalMem, mi.availMem, mi.lowMemory)
+        }.getOrDefault(Triple(0L, 0L, false))
+        return budgetForMemory(memory.first, memory.second, memory.third, cores)
+    }
+
+    /** Pure form of [budget], kept separate so the device tiers are testable. */
+    internal fun budgetForMemory(
+        totalBytes: Long,
+        availableBytes: Long,
+        lowMemory: Boolean,
+        cores: Int,
+    ): Budget {
+        val processorCount = cores.coerceAtLeast(1)
+        val totalGb = totalBytes / GIB.toDouble()
+        val availableGb = availableBytes / GIB.toDouble()
+
+        val physical = when {
+            // Unknown is deliberately conservative. This path is a build, not
+            // gameplay, and an unexplained slowdown is cheaper than losing it.
+            totalBytes <= 0L -> Budget(processorCount.coerceAtMost(2), 512)
+            totalGb >= 7.0 -> Budget(processorCount, 0)
+            totalGb >= 5.2 -> Budget(processorCount.coerceAtMost(2), 512)
             else -> Budget(1, FLOOR_HEAP_MB)
         }
+        val available = when {
+            lowMemory -> Budget(1, FLOOR_HEAP_MB)
+            availableBytes <= 0L -> Budget(processorCount.coerceAtMost(2), 512)
+            availableGb < 2.25 -> Budget(1, FLOOR_HEAP_MB)
+            availableGb < 3.5 -> Budget(processorCount.coerceAtMost(2), 512)
+            else -> Budget(processorCount, 0)
+        }
+        return physical.constrainedBy(available)
     }
 
     /**
@@ -262,6 +297,7 @@ object MonoRuntime {
         args: List<String> = emptyList(),
         cwd: File? = null,
         env: Map<String, String> = emptyMap(),
+        onMemorySample: (Long) -> Unit = {},
         onLine: (String) -> Unit = {},
     ): Toolchain.Result = withContext(Dispatchers.IO) {
         if (!assembly.isFile) throw IOException("no such assembly: $assembly")
@@ -398,6 +434,7 @@ object MonoRuntime {
                     sampled = now
                     val rss = builderRssKb(builder.pid)
                     if (rss > peakKb) peakKb = rss
+                    onMemorySample(rss)
                 }
                 delay(120)
             }
@@ -627,25 +664,19 @@ object MonoRuntime {
                     this,
                     // AUTO_CREATE is what starts the process, and holding the
                     // binding is what keeps it out of the cached bucket --
-                    // which is all the provider connection this replaces did,
-                    // and all that issue #6 needs. Deliberately not
-                    // BIND_IMPORTANT: that would also put a process that pegs
-                    // every core for ten minutes in the foreground scheduling
-                    // group, which is a change to how every device runs a
-                    // build and is not what was wrong with this one.
+                    // which is all the provider connection this replaces did.
+                    // The build is now explicitly user-visible and constrained
+                    // by a memory/core budget, so allowing its worker to follow
+                    // that foreground priority is both bounded and intentional.
                     //
-                    // ABOVE_CLIENT says the builder matters more than the app
-                    // that asked for it, which is simply true: :launcher is a
-                    // progress bar and can be rebuilt from nothing, while the
-                    // builder is holding an hour of work that has to start
-                    // again if it goes. Without it the activity manager floors
-                    // the builder at the visible bucket even while the
-                    // launcher is in the foreground, so on a device short of
-                    // memory the process carrying the whole build is offered
-                    // to the low memory killer several levels before the one
-                    // drawing the screen. It changes only that ordering; the
-                    // scheduling group is BIND_IMPORTANT's doing, not this.
-                    Context.BIND_AUTO_CREATE or Context.BIND_ABOVE_CLIENT,
+                    // IMPORTANT lets the builder follow the foreground
+                    // launcher while the user-visible build is active. The old
+                    // ABOVE_CLIENT flag explicitly asked Android to kill the
+                    // launcher first under pressure; that launcher owns the
+                    // result tail, retry ladder and completion markers, so
+                    // sacrificing it also sacrifices the build even when the
+                    // builder itself survives for a moment longer.
+                    Context.BIND_AUTO_CREATE or Context.BIND_IMPORTANT,
                 )
             }.getOrDefault(false)
             if (!bound) {
@@ -751,11 +782,10 @@ object MonoRuntime {
     /**
      * Whether this process is one the user is looking at.
      *
-     * Which is the same question as whether killBackgroundProcesses would
-     * take it: that reaps everything at or below service importance, and a
-     * launcher with no foreground service is a cached process the moment the
-     * user leaves. Not being able to tell counts as "no" -- the cost of
-     * being wrong one way is a straggler, and the other way is the build.
+     * This asks whether the user is actually looking at the launcher, not
+     * whether its build keep-alive service makes it merely visible. Not being
+     * able to tell counts as "no" -- the cost of being wrong one way is a
+     * straggler, and the other way is the build.
      */
     private fun launcherForeground(): Boolean = runCatching {
         val state = ActivityManager.RunningAppProcessInfo()

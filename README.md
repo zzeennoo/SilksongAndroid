@@ -30,11 +30,17 @@ Steam integration for game files and cloud saves.
 2. Supply your own game files. Either copy them across from your PC yourself,
    or let the app fetch them for you by signing in to Steam.
 3. Press the button. The app fetches everything it needs and builds the game.
-   The build takes 20–30 minutes on a Snapdragon 8 Gen 2, most of it the download and the compile.
+   The build takes 20–30 minutes on a roomy Snapdragon 8 Gen 2. Low-memory
+   devices automatically use fewer workers and can take considerably longer.
 4. Play. After the first build, launching is instant.
 
 Any device should do (tested on the AYN Thor and the Retroid Pocket Flip 2). Open an issue
 if your device doesn't work.
+
+The native compile is crash-resumable: completed objects are verified and
+reused on the next attempt. IL2CPP conversion still has to finish in one run,
+so constrained devices use its lower-peak partial-per-assembly mode and retain
+an interrupted-attempt checkpoint for safer retry settings.
 
 ### Supplying the game files yourself
 

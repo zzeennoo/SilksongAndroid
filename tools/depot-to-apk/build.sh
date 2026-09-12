@@ -246,6 +246,8 @@ step_5_apk_shell() {
             android:exported="false" android:process=":builder" />
         <service android:name="dev.silksong.launcher.MonoServiceAlt"
             android:exported="false" android:process=":builder2" />
+        <service android:name="dev.silksong.launcher.BuildKeepAliveService"
+            android:exported="false" android:process=":launcher" />
 XML
 )
         # The heredoc above is quoted, so that the XML is taken literally and
@@ -283,6 +285,10 @@ XML
       prompted for.
     -->
     <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+    <!-- The user-visible on-device build is kept alive by a foreground service. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Keeps a user-started build running if the display sleeps. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!--
       Storage, for the folder a user may pick to say where their copy of the
       game already is. The picker hands back a URI; what every step after it

@@ -16,6 +16,8 @@
       prompted for.
     -->
     <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!--
       Library AAR manifest. AGP merges this into the host (Silksong)
@@ -119,6 +121,10 @@
             android:name="dev.silksong.launcher.MonoServiceAlt"
             android:exported="false"
             android:process=":builder2" />
+        <service
+            android:name="dev.silksong.launcher.BuildKeepAliveService"
+            android:exported="false"
+            android:process=":launcher" />
     </application>
 
 </manifest>

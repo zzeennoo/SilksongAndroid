@@ -94,9 +94,12 @@ object cache misses and the native build goes from 72 s to 532 s.
 
 `--jobs` is already saturated; the converter uses the cores it is given.
 
-So the conversion stays whole-program. What makes rebuilds bearable is
-downstream: `build-il2cpp.sh` hashes every generated file and skips the
-unchanged ones.
+So the conversion stays whole-program on devices with ample memory. A
+constrained device uses `PartialPerAssemblyInProcess` as a peak-memory trade,
+not as a cache: it still has to finish that conversion in one process. What
+makes the downstream native build resumable is `build-il2cpp.sh`: every
+successfully compiled object is moved into place with its content-hash sidecar,
+so a killed build can trust those objects and continue with the remainder.
 
 ## Running .NET on Android
 

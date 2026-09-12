@@ -936,6 +936,8 @@ class SetupActivity : Activity() {
         setStep(if (download != null) 1 else toolsStep, "Starting")
         setBusy(true, "", -1f, "")
         LauncherLog.log("depot: $depot, data: ${PlayerImage.depotData(depot)}")
+        runCatching { BuildKeepAliveService.start(this) }
+            .onFailure { LauncherLog.log("setup: could not start the build keep-alive service", it) }
         // Nothing survives the process being reclaimed, and a screen that
         // sleeps is the most likely way for that to happen during a build
         // nobody is watching. This costs no permission.
@@ -1019,7 +1021,17 @@ class SetupActivity : Activity() {
                     Il2cppConverter.convert(unity, depot, this@SetupActivity, out, mods, assets)
                         .collect { setBusy(true, it.step, it.fraction, it.detail) }
                 }
-                NativeBuild.build(unity, tools, out, assets, install = engineDir)
+                val nativeBudget = Il2cppConverter.completedBudget(out)?.let {
+                    MonoRuntime.budget(this@SetupActivity).constrainedBy(it)
+                } ?: MonoRuntime.budget(this@SetupActivity)
+                NativeBuild.build(
+                    unity,
+                    tools,
+                    out,
+                    assets,
+                    install = engineDir,
+                    budget = nativeBudget,
+                )
                     .collect { setBusy(true, it.step, it.fraction, it.detail) }
                 // Both of these are skipped when the image already matches
                 // what they would produce, which is every build where the
@@ -1058,6 +1070,7 @@ class SetupActivity : Activity() {
                 LauncherLog.log("Setup failed", t)
                 say("Failed: ${t.message}")
             } finally {
+                runCatching { BuildKeepAliveService.stop(this@SetupActivity) }
                 window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 setBusy(false)
                 refresh()
