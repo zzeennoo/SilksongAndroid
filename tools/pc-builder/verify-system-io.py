@@ -25,11 +25,9 @@ def method_body(text: str, symbol: str) -> str | None:
 
 def verify(root: Path) -> None:
     sources = sorted(root.glob("*.cpp")) + sorted(root.glob("*.c"))
-    texts: list[tuple[Path, str]] = []
+    texts = [source.read_text(encoding="utf-8", errors="replace") for source in sources]
     path_body: str | None = None
-    for source in sources:
-        text = source.read_text(encoding="utf-8", errors="replace")
-        texts.append((source, text))
+    for text in texts:
         if "PathInternal_GetIsCaseSensitive" in text:
             match = re.search(r"\b(PathInternal_GetIsCaseSensitive_m[0-9A-F]+)\s*\(", text)
             if match:
@@ -40,43 +38,34 @@ def verify(root: Path) -> None:
     if path_body is None:
         raise SystemExit("IL2CPP smoke: PathInternal.GetIsCaseSensitive was not generated")
 
-    ctor = re.search(r"\b(FileStream__ctor_m[0-9A-F]+)\s*\(", path_body)
-    if ctor is None:
+    roots = re.findall(r"\b(FileStream__ctor_m[0-9A-F]+)\s*\(", path_body)
+    if not roots:
         raise SystemExit("IL2CPP smoke: PathInternal no longer calls a recognizable FileStream constructor")
 
-    symbol = ctor.group(1)
-    for _, text in texts:
-        if symbol not in text:
+    # PathInternal calls one convenience overload, which can call another.
+    # The original regression lived in that second constructor, so checking
+    # only the direct call produces a dangerously reassuring false positive.
+    # Follow every generated FileStream constructor edge until the chain ends.
+    pending = list(dict.fromkeys(roots))
+    verified: list[str] = []
+    while pending:
+        symbol = pending.pop(0)
+        if symbol in verified:
             continue
-        body = method_body(text, symbol)
-        if body is not None:
-            if "il2cpp_codegen_get_not_supported_exception" in body:
-                raise SystemExit(
-                    f"IL2CPP smoke: {symbol} is an unsupported-method stub; Android would abort at boot"
-                )
-            print(f"[docker] verified Android System.IO implementation: {symbol}")
-            return
+        body = next((method_body(text, symbol) for text in texts if symbol in text), None)
+        if body is None:
+            raise SystemExit(f"IL2CPP smoke: generated constructor definition not found: {symbol}")
+        if "il2cpp_codegen_get_not_supported_exception" in body:
+            chain = " -> ".join(verified + [symbol])
+            raise SystemExit(
+                f"IL2CPP smoke: {chain} reaches an unsupported-method stub; Android would abort at boot"
+            )
+        verified.append(symbol)
+        for called in re.findall(r"\b(FileStream__ctor_m[0-9A-F]+)\s*\(", body):
+            if called not in verified and called not in pending:
+                pending.append(called)
 
-    # The constructor's source might sort after the PathInternal source. Read
-    # any files not reached before the early break above.
-    seen = {path for path, _ in texts}
-    for source in sources:
-        if source in seen:
-            continue
-        text = source.read_text(encoding="utf-8", errors="replace")
-        if symbol not in text:
-            continue
-        body = method_body(text, symbol)
-        if body is not None:
-            if "il2cpp_codegen_get_not_supported_exception" in body:
-                raise SystemExit(
-                    f"IL2CPP smoke: {symbol} is an unsupported-method stub; Android would abort at boot"
-                )
-            print(f"[docker] verified Android System.IO implementation: {symbol}")
-            return
-
-
-    raise SystemExit(f"IL2CPP smoke: generated constructor definition not found: {symbol}")
+    print("[docker] verified Android System.IO constructor chain: " + " -> ".join(verified))
 
 
 if __name__ == "__main__":

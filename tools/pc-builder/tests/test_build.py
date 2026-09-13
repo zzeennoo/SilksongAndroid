@@ -3,6 +3,7 @@ import importlib.util
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -10,6 +11,7 @@ from pathlib import Path
 
 
 MODULE_PATH = Path(__file__).parents[1] / "build.py"
+VERIFY_SYSTEM_IO = Path(__file__).parents[1] / "verify-system-io.py"
 SPEC = importlib.util.spec_from_file_location("pc_builder", MODULE_PATH)
 pc_builder = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -116,6 +118,54 @@ class PcBuilderTests(unittest.TestCase):
             legacy.update(b"mscorlib.dll\0")
             legacy.update(b"same assemblies")
             self.assertNotEqual(legacy.hexdigest(), actual)
+
+    def test_system_io_guard_follows_delegating_constructor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "System.Private.CoreLib.cpp").write_text(
+                """
+                bool PathInternal_GetIsCaseSensitive_mAAAA() {
+                    FileStream__ctor_mBBBB();
+                }
+                void FileStream__ctor_mBBBB() {
+                    FileStream__ctor_mCCCC();
+                }
+                void FileStream__ctor_mCCCC() {
+                    il2cpp_codegen_get_not_supported_exception("FileStream");
+                }
+                """,
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [sys.executable, str(VERIFY_SYSTEM_IO), str(root)],
+                text=True, capture_output=True,
+            )
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("FileStream__ctor_mBBBB -> FileStream__ctor_mCCCC", result.stderr)
+
+    def test_system_io_guard_accepts_implemented_constructor_chain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "System.Private.CoreLib.cpp").write_text(
+                """
+                bool PathInternal_GetIsCaseSensitive_mAAAA() {
+                    FileStream__ctor_mBBBB();
+                }
+                void FileStream__ctor_mBBBB() {
+                    FileStream__ctor_mCCCC();
+                }
+                void FileStream__ctor_mCCCC() {
+                    open_file();
+                }
+                """,
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [sys.executable, str(VERIFY_SYSTEM_IO), str(root)],
+                text=True, capture_output=True,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("FileStream__ctor_mBBBB -> FileStream__ctor_mCCCC", result.stdout)
 
     def test_bundle_uses_the_importers_exact_entry_names(self):
         with tempfile.TemporaryDirectory() as tmp:
