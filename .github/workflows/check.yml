@@ -1,0 +1,86 @@
+name: Build check
+
+on:
+  push:
+    branches: [master, "codex/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check desktop builder and shell scripts
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools/pc-builder/tests -v
+          python3 -m py_compile tools/pc-builder/build.py
+          bash -n tools/docker/apk-entrypoint.sh
+          bash -n tools/ondevice-il2cpp/build-il2cpp.sh
+          bash -n tools/depot-to-apk/build.sh
+          git diff --check
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build the larger Windows/PC target here. It contains the ordinary APK
+      # environment too, and proving this stage installs catches an NDK/image
+      # regression before somebody downloads several gigabytes on Windows.
+      - name: Build the PC image
+        uses: docker/build-push-action@v6
+        with:
+          context: tools/docker
+          file: tools/docker/apk.Dockerfile
+          target: pc
+          platforms: linux/amd64
+          tags: silksong-pc-builder:check
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify bundle signing inside the PC image
+        run: |
+          docker run --rm --platform linux/amd64 \
+            --entrypoint python3 \
+            --workdir /workspace \
+            -v "$PWD:/workspace" \
+            silksong-pc-builder:check \
+            -m unittest discover -s tools/pc-builder/tests -v
+
+      - name: Cache build inputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            .ci-cache/unity-player
+            .ci-cache/gradle
+            .ci-cache/nuget
+            .ci-cache/build
+          key: check-${{ hashFiles('tools/ondevice-il2cpp/fetch-unity.sh', 'src/SilksongLauncher.Launcher/**/*.kts') }}-${{ github.sha }}
+          restore-keys: |
+            check-${{ hashFiles('tools/ondevice-il2cpp/fetch-unity.sh', 'src/SilksongLauncher.Launcher/**/*.kts') }}-
+            check-
+
+      - name: Compile APK and Android tests
+        run: |
+          set -euo pipefail
+          mkdir -p .ci-cache/{unity-player,gradle,nuget,build}
+          docker run --rm --platform linux/amd64 \
+            -v "$PWD:/workspace" \
+            -v "$PWD/.ci-cache/unity-player:/opt/unity-player" \
+            -v "$PWD/.ci-cache/gradle:/gradle" \
+            -v "$PWD/.ci-cache/nuget:/root/.nuget/packages" \
+            -v "$PWD/.ci-cache/build:/root/.cache/silksong" \
+            -e GRADLE_DAEMON=0 \
+            -e DEBUGGABLE=0 \
+            -e RUN_TESTS=1 \
+            silksong-pc-builder:check apk
+          sudo chown -R "$(id -u):$(id -g)" .ci-cache build

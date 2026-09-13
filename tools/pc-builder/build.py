@@ -1,0 +1,741 @@
+#!/usr/bin/env python3
+"""Build a private Android runtime bundle from a user's Linux depot.
+
+This runs inside tools/docker/apk.Dockerfile.  It deliberately emits a bundle
+for the launcher to import rather than an APK containing the game: the depot's
+8 GB Addressables tree stays on the user's device, while the expensive IL2CPP
+conversion and native compile happen on the PC.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import zipfile
+from pathlib import Path
+
+
+UNITY_VERSION = "6000.0.50f1"
+PACKAGE = "com.jakobkhansen.silksong"
+CONTENT_ROOT = f"/data/user/0/{PACKAGE}/files/aa"
+ROSLYN_VERSION = "4.12.0"
+ROSLYN_BYTES = 21_775_071
+ROSLYN_FILES = (
+    "csc.dll",
+    "csc.deps.json",
+    "csc.runtimeconfig.json",
+    "Microsoft.CodeAnalysis.dll",
+    "Microsoft.CodeAnalysis.CSharp.dll",
+)
+TEXT_EXTENSIONS = {"cs", "json", "sh", "txt", "rsp", "xml", "md"}
+
+
+def note(message: str) -> None:
+    print(f"[pc-build] {message}", flush=True)
+
+
+def fail(message: str) -> "NoReturn":
+    raise SystemExit(f"[pc-build] ERROR: {message}")
+
+
+def run(argv: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
+    shown = " ".join(argv[:3]) + (" …" if len(argv) > 3 else "")
+    note(shown)
+    subprocess.run(argv, cwd=cwd, env=env, check=True)
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def update_file(digest: "hashlib._Hash", path: Path) -> None:
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+
+
+def find_depot_data(depot: Path) -> Path:
+    level = sorted((p for p in depot.iterdir() if p.is_dir()), key=lambda p: p.name)
+    for _ in range(4):
+        for directory in level:
+            if (
+                directory.name.endswith("_Data")
+                and (directory / "globalgamemanagers").is_file()
+                and (directory / "Managed" / "Assembly-CSharp.dll").is_file()
+            ):
+                return directory
+        level = sorted(
+            (child for directory in level for child in directory.iterdir() if child.is_dir()),
+            key=lambda p: str(p),
+        )
+    fail(f"no Linux Silksong *_Data directory was found below {depot}")
+
+
+def depot_fingerprint(data: Path) -> str:
+    """Must remain byte-for-byte equivalent to PcBuildImport.depotFingerprint."""
+    files = sorted((data / "Managed").glob("*.dll"), key=lambda p: p.name)
+    for name in ("globalgamemanagers", "ScriptingAssemblies.json"):
+        path = data / name
+        if path.is_file():
+            files.append(path)
+    digest = hashlib.sha256()
+    for path in sorted(files, key=lambda p: p.relative_to(data).as_posix()):
+        relative = path.relative_to(data).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        update_file(digest, path)
+    return digest.hexdigest()
+
+
+def launcher_signature(asset_root: Path) -> str:
+    """Equivalent to BuildInstallation.signature/AssetDigest on Android."""
+    if not asset_root.is_dir():
+        fail(f"launcher assets were not staged at {asset_root}; build the APK first")
+    digest = hashlib.sha256()
+
+    # AssetManager walks each directory in name order before returning to its
+    # siblings. A flat sort is subtly different for a directory and file that
+    # share a prefix ("patches/x" versus "patches.txt"), so mirror that walk
+    # exactly instead of relying on the current asset names not to expose it.
+    def walk(directory: Path):
+        for path in sorted(directory.iterdir(), key=lambda p: p.name):
+            if path.is_dir():
+                yield from walk(path)
+            elif path.is_file():
+                yield path
+
+    for path in walk(asset_root):
+        data = path.read_bytes()
+        if path.suffix.lower().lstrip(".") in TEXT_EXTENSIONS:
+            data = data.replace(b"\r\n", b"\n")
+        digest.update(data)
+    return "2|" + digest.hexdigest()[:16]
+
+
+def automatic_jobs() -> int:
+    """A conservative worker count based on the container's actual limit."""
+    cpu = os.cpu_count() or 1
+    memory = None
+    for candidate in (Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")):
+        try:
+            value = candidate.read_text(encoding="ascii").strip()
+            if value != "max":
+                parsed = int(value)
+                # Old cgroups report an enormous sentinel when unlimited.
+                if 0 < parsed < (1 << 60):
+                    memory = parsed
+                    break
+        except (OSError, ValueError):
+            pass
+    if memory is None:
+        try:
+            for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+                if line.startswith("MemTotal:"):
+                    memory = int(line.split()[1]) * 1024
+                    break
+        except (OSError, ValueError, IndexError):
+            pass
+
+    # IL2CPP is much more memory hungry than clang. Budget about 2 GiB per
+    # worker and cap at eight: this is intentionally a reliable default for a
+    # typical 8-16 GiB Docker Desktop VM, not a benchmark setting.
+    by_memory = max(1, (memory or (4 << 30)) // (2 << 30))
+    return max(1, min(cpu, by_memory, 8))
+
+
+def unique_dlls(*directories: Path, skip: set[str] | None = None) -> list[Path]:
+    seen = set(skip or ())
+    result: list[Path] = []
+    for directory in directories:
+        for path in sorted(directory.glob("*.dll"), key=lambda p: p.name):
+            if path.name in seen:
+                continue
+            seen.add(path.name)
+            result.append(path)
+    return result
+
+
+def ensure_roslyn(cache: Path) -> Path:
+    out = cache / "roslyn"
+    csc = out / "csc.dll"
+    if all((out / name).is_file() for name in ROSLYN_FILES):
+        return csc
+
+    out.mkdir(parents=True, exist_ok=True)
+    package = cache / f"microsoft.net.compilers.toolset.{ROSLYN_VERSION}.nupkg"
+    if not package.is_file() or package.stat().st_size != ROSLYN_BYTES:
+        package.unlink(missing_ok=True)
+        url = (
+            "https://api.nuget.org/v3-flatcontainer/microsoft.net.compilers.toolset/"
+            f"{ROSLYN_VERSION}/microsoft.net.compilers.toolset.{ROSLYN_VERSION}.nupkg"
+        )
+        note("fetching the pinned Roslyn compiler (22 MB, once)")
+        run(["curl", "-fL", "--retry", "5", "-o", str(package) + ".part", url])
+        Path(str(package) + ".part").replace(package)
+    if package.stat().st_size != ROSLYN_BYTES:
+        fail(f"Roslyn package has an unexpected size: {package.stat().st_size}")
+
+    prefix = "tasks/netcore/bincore/"
+    with zipfile.ZipFile(package) as archive:
+        for name in ROSLYN_FILES:
+            member = prefix + name
+            try:
+                data = archive.read(member)
+            except KeyError:
+                fail(f"Roslyn package does not contain {member}")
+            (out / name).write_bytes(data)
+    return csc
+
+
+def quote_rsp(value: Path) -> str:
+    return '"' + str(value).replace('"', '\\"') + '"'
+
+
+def compile_cs(
+    csc: Path,
+    root: Path,
+    name: str,
+    output: Path,
+    sources: list[Path],
+    references: list[Path],
+    defines: list[str],
+    *,
+    unsafe: bool = False,
+    warnings: str = "0169,0414,0649,0067",
+) -> None:
+    if not sources:
+        fail(f"no C# sources for {name}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    rsp = root / f"{name}.rsp"
+    lines = [
+        "-target:library",
+        f"-out:{quote_rsp(output)}",
+        "-optimize+",
+        "-nostdlib+",
+        "-noconfig",
+        "-langversion:9.0",
+        "-deterministic+",
+    ]
+    if warnings:
+        lines.append(f"-nowarn:{warnings}")
+    if unsafe:
+        lines.append("-unsafe+")
+    if defines:
+        lines.append("-define:" + ";".join(defines))
+    lines.extend(f"-reference:{quote_rsp(path)}" for path in references)
+    lines.extend(quote_rsp(path) for path in sources)
+    rsp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    note(f"compiling {name} ({len(sources)} sources)")
+    run(["dotnet", str(csc), "@" + str(rsp)], cwd=root)
+    if not output.is_file() or output.stat().st_size == 0:
+        fail(f"Roslyn produced no {output.name}")
+
+
+def input_system_defines() -> list[str]:
+    result = [
+        "UNITY_ANDROID", "UNITY_ANDROID_API", "ENABLE_INPUT_SYSTEM",
+        "UNITY_INPUT_SYSTEM_ENABLE_UI", "UNITY_INPUT_SYSTEM_ENABLE_PHYSICS",
+        "UNITY_INPUT_SYSTEM_ENABLE_PHYSICS2D", "UNITY_INPUT_SYSTEM_ENABLE_XR",
+        "UNITY_INPUT_SYSTEM_ENABLE_VR", "UNITY_INPUT_SYSTEM_ENABLE_ANALYTICS",
+        "HAS_SET_LOCAL_POSITION_AND_ROTATION", "UNITY_INPUT_SYSTEM_PROJECT_WIDE_ACTIONS",
+        "UNITY_INPUT_SYSTEM_INPUT_ACTIONS_EDITOR_AUTO_SAVE_ON_FOCUS_LOST",
+        "UNITY_INPUT_SYSTEM_PLATFORM_SCROLL_DELTA", "UNITY_INPUT_SYSTEM_INPUT_MODULE_SCROLL_DELTA",
+        "UNITY_INPUT_SYSTEM_SENDPOINTERHOVERTOPARENT", "ENABLE_VR", "ENABLE_XR",
+        "ENABLE_MONO", "NET_STANDARD_2_1", "NET_STANDARD",
+    ]
+    for year in range(2017, 2024):
+        result.extend(f"UNITY_{year}_{stream}_OR_NEWER" for stream in range(1, 4))
+        result.append(f"UNITY_{year}_OR_NEWER")
+    result.extend(("UNITY_6000_0_OR_NEWER", "UNITY_6000_OR_NEWER"))
+    return result
+
+
+def compile_packages(repo: Path, unity: Path, data: Path, root: Path, csc: Path) -> Path:
+    packages = root / "packages"
+    packages.mkdir(parents=True, exist_ok=True)
+    bcl = unity / "editor/Editor/Data/MonoBleedingEdge/lib/mono/unityaot-linux"
+    engine = unity / "android/Variations/il2cpp/Managed"
+    managed = data / "Managed"
+    if not (bcl / "mscorlib.dll").is_file():
+        fail(f"Unity AOT class library is missing from {bcl}")
+    if not engine.is_dir():
+        fail(f"Unity Android managed assemblies are missing from {engine}")
+
+    input_root = unity / "packages/com.unity.inputsystem/InputSystem"
+    nested = {
+        path.parent
+        for path in input_root.rglob("*.asmdef")
+        if path != input_root / "Unity.InputSystem.asmdef"
+    }
+    input_sources = [
+        path for path in input_root.rglob("*.cs")
+        if not any(parent == path.parent or parent in path.parents for parent in nested)
+    ]
+    input_refs = unique_dlls(bcl, engine, skip={"Unity.InputSystem.dll"})
+    input_refs.extend(
+        path for name in ("UnityEngine.UI.dll", "netstandard.dll")
+        if (path := managed / name).is_file() and path.name not in {p.name for p in input_refs}
+    )
+    compile_cs(
+        csc, root, "inputsystem", packages / "Unity.InputSystem.dll",
+        sorted(input_sources), input_refs, input_system_defines(), unsafe=True,
+        warnings="0169,0414,0649,3021,0067",
+    )
+
+    patch_refs = unique_dlls(bcl, engine, managed)
+    io_refs = unique_dlls(bcl, engine)
+    netstandard = managed / "netstandard.dll"
+    if netstandard.is_file() and netstandard.name not in {p.name for p in io_refs}:
+        io_refs.append(netstandard)
+
+    compile_cs(
+        csc, root, "silksong-io", packages / "SilksongIo.dll",
+        sorted((repo / "tools/silksong-io/src").rglob("*.cs")), io_refs,
+        ["UNITY_ANDROID"], warnings="",
+    )
+    compile_cs(
+        csc, root, "patches", packages / "SilksongPatches.dll",
+        sorted((repo / "tools/silksong-patches/src").rglob("*.cs")), patch_refs,
+        ["UNITY_ANDROID", "ENABLE_INPUT_SYSTEM"],
+    )
+    for assembly, folder in (("0Harmony", "harmony"), ("BepInEx", "bepinex")):
+        compile_cs(
+            csc, root, assembly.lower(), packages / f"{assembly}.dll",
+            sorted((repo / f"tools/bepinex-shim/src/{folder}").rglob("*.cs")), patch_refs,
+            ["UNITY_ANDROID", "ENABLE_INPUT_SYSTEM"],
+        )
+    return packages
+
+
+def stage_assemblies(unity: Path, data: Path, packages: Path, root: Path) -> Path:
+    asm = root / "asm"
+    shutil.rmtree(asm, ignore_errors=True)
+    asm.mkdir(parents=True)
+    sources = (
+        unity / "editor/Editor/Data/MonoBleedingEdge/lib/mono/unityaot-linux",
+        unity / "android/Variations/il2cpp/Managed",
+        data / "Managed",
+    )
+    for directory in sources:
+        for dll in sorted(directory.glob("*.dll"), key=lambda p: p.name):
+            target = asm / dll.name
+            if not target.exists():
+                shutil.copy2(dll, target)
+    for dll in sorted(packages.glob("*.dll"), key=lambda p: p.name):
+        shutil.copy2(dll, asm / dll.name)
+    note(f"staged {len(list(asm.glob('*.dll')))} IL2CPP assemblies")
+    return asm
+
+
+def prepare_il2cpp(unity: Path, cache: Path) -> Path:
+    source = unity / "editor/Editor/Data/il2cpp/build/deploy"
+    deploy = cache / "il2cpp-deploy"
+    marker = deploy / ".silksong-prepared"
+    if marker.is_file() and (deploy / "il2cpp.dll").is_file():
+        return deploy
+    shutil.rmtree(deploy, ignore_errors=True)
+    shutil.copytree(source, deploy)
+    doomed = {
+        "System.Private.CoreLib.dll", "libcoreclr.so", "libclrjit.so", "libclrgc.so",
+        "libhostfxr.so", "libhostpolicy.so", "libmscordaccore.so", "libmscordbi.so",
+        "libcoreclrtraceptprovider.so", "createdump", "il2cpp", "il2cpp-compile",
+    }
+    for path in list(deploy.iterdir()):
+        if (
+            path.name in doomed
+            or path.name.endswith(".deps.json")
+            or path.name.endswith(".pdb")
+            or (path.name.startswith("libSystem.") and path.name.endswith(".so"))
+        ):
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+    (deploy / "il2cpp.runtimeconfig.json").write_text(
+        json.dumps({
+            "runtimeOptions": {
+                "tfm": "net8.0",
+                "framework": {"name": "Microsoft.NETCore.App", "version": "8.0.0"},
+                "rollForward": "latestMajor",
+                "configProperties": {
+                    "System.GC.Server": False,
+                    "System.Globalization.Invariant": True,
+                    "System.Globalization.PredefinedCulturesOnly": True,
+                    "System.Runtime.TieredCompilation.QuickJit": False,
+                },
+            }
+        }, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    marker.write_text("", encoding="utf-8")
+    return deploy
+
+
+def tree_digest(directory: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(directory.glob("*.dll"), key=lambda p: p.name):
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        update_file(digest, path)
+    return digest.hexdigest()
+
+
+def convert(repo: Path, unity: Path, root: Path, asm: Path, jobs: int) -> tuple[Path, Path]:
+    surgery = repo / "tools/bundle-surgery/bin/Release/net8.0/BundleSurgery.dll"
+    weaver = repo / "tools/mod-weaver/bin/Release/net8.0/ModWeaver.dll"
+    run(["dotnet", str(surgery), "redirect-file-replace", str(asm / "Assembly-CSharp.dll"), str(asm / "SilksongIo.dll")])
+    run(["dotnet", str(weaver), "builtin", "--assemblies", str(asm)])
+
+    cpp = root / "cpp"
+    data = root / "data"
+    signature = tree_digest(asm)
+    marker = root / "conversion.inputs"
+    complete = (
+        marker.is_file() and marker.read_text().strip() == signature
+        and (data / "Metadata/global-metadata.dat").is_file()
+        and len(list(cpp.glob("*.cpp"))) > 100
+    )
+    if complete:
+        note("IL2CPP conversion is current; reusing it")
+        return cpp, data
+
+    shutil.rmtree(cpp, ignore_errors=True)
+    shutil.rmtree(data, ignore_errors=True)
+    cpp.mkdir(parents=True)
+    data.mkdir(parents=True)
+    deploy = prepare_il2cpp(unity, root)
+    argv = ["dotnet", str(deploy / "il2cpp.dll"), "--convert-to-cpp"]
+    argv.extend(f"--assembly={path}" for path in sorted(asm.glob("*.dll"), key=lambda p: p.name))
+    argv.extend((
+        f"--generatedcppdir={cpp}", f"--data-folder={data}",
+        "--dotnetprofile=unityaot-linux", "--emit-null-checks",
+        "--enable-array-bounds-check", "--static-lib-il2-cpp", f"--jobs={jobs}",
+    ))
+    env = os.environ.copy()
+    env["DOTNET_PROCESSOR_COUNT"] = str(jobs)
+    note(f"converting IL to C++ with {jobs} worker(s)")
+    run(argv, cwd=deploy, env=env)
+    metadata = data / "Metadata/global-metadata.dat"
+    source_count = len(list(cpp.glob("*.cpp"))) + len(list(cpp.glob("*.c")))
+    if not metadata.is_file() or metadata.stat().st_size == 0 or source_count < 100:
+        fail(f"IL2CPP output is incomplete ({source_count} sources, metadata={metadata.exists()})")
+    marker.write_text(signature + "\n", encoding="utf-8")
+    note(f"IL2CPP produced {source_count} native sources")
+    return cpp, data
+
+
+def find_android_file(android: Path, suffix: str) -> Path:
+    wanted = suffix.replace("\\", "/")
+    for path in android.rglob(Path(suffix).name):
+        if path.is_file() and path.as_posix().endswith(wanted):
+            return path
+    fail(f"Unity Android module does not contain {suffix}")
+
+
+def compile_native(repo: Path, unity: Path, root: Path, jobs: int) -> Path:
+    ndk = Path(os.environ.get("ANDROID_NDK_ROOT", "/opt/android-sdk/ndk/27.2.12479018"))
+    host = ndk / "toolchains/llvm/prebuilt/linux-x86_64"
+    if not (host / "bin/clang").is_file():
+        fail(f"the pinned Android NDK is missing at {ndk}")
+    baselib = find_android_file(
+        unity / "android",
+        "Variations/il2cpp/Release/StaticLibs/arm64-v8a/baselib.a",
+    )
+    il2cpp = unity / "editor/Editor/Data/il2cpp"
+    env = os.environ.copy()
+    env.update({
+        "ROOT": str(root), "USR": str(host), "SYSROOT": str(host / "sysroot"),
+        "LIBIL2CPP": str(il2cpp / "libil2cpp"), "EXTERNAL": str(il2cpp / "external"),
+        "BASELIB": str(baselib), "CPPDIR": str(root / "cpp"),
+        "BUILD_JOBS": str(jobs), "OPT": "-O2",
+    })
+    note(f"cross-compiling ARM64 libil2cpp.so with {jobs} job(s)")
+    run(["bash", str(repo / "tools/ondevice-il2cpp/build-il2cpp.sh")], cwd=root, env=env)
+    output = root / "libil2cpp.so"
+    if not output.is_file() or output.stat().st_size < 10 * 1024 * 1024:
+        fail("native link produced no plausible libil2cpp.so")
+    return output
+
+
+def retarget_serialized(path: Path) -> None:
+    data = bytearray(path.read_bytes())
+    index = 48
+    while index < len(data) and data[index] != 0:
+        index += 1
+    if index + 4 >= len(data):
+        fail(f"{path.name}: no Unity version string to retarget")
+    data[index + 1:index + 5] = (13).to_bytes(4, "little")
+    path.write_bytes(data)
+
+
+def register_patches(image: Path, asm: Path, entrypoints: Path) -> None:
+    names = [name for name in ("SilksongPatches.dll", "0Harmony.dll", "BepInEx.dll") if (asm / name).is_file()]
+    scripting = image / "ScriptingAssemblies.json"
+    if scripting.is_file():
+        payload = json.loads(scripting.read_text(encoding="utf-8"))
+        listed = payload.get("names", [])
+        types = payload.get("types")
+        for name in names:
+            if name not in listed:
+                listed.append(name)
+                if isinstance(types, list):
+                    types.append(16)
+        scripting.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+
+    loads_path = image / "RuntimeInitializeOnLoads.json"
+    if not loads_path.is_file():
+        return
+    payload = json.loads(loads_path.read_text(encoding="utf-8"))
+    rows = payload["root"]
+
+    def add(assembly: str, namespace: str, klass: str, method: str, load_types: int) -> None:
+        if any(
+            row.get("assemblyName") == assembly
+            and row.get("className") == klass
+            and row.get("methodName") == method
+            for row in rows
+        ):
+            return
+        rows.append({
+            "assemblyName": assembly, "nameSpace": namespace, "className": klass,
+            "methodName": method, "loadTypes": load_types, "isUnityClass": False,
+        })
+
+    entries = json.loads(entrypoints.read_text(encoding="utf-8"))["entryPoints"]
+    for entry in entries:
+        add(
+            "SilksongPatches", entry.get("nameSpace", ""), entry["className"],
+            entry["methodName"], int(entry["loadTypes"]),
+        )
+    if "BepInEx.dll" in names:
+        add("BepInEx", "BepInEx.Bootstrap", "Chainloader", "Start", 2)
+    loads_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+
+
+def build_player_image(repo: Path, unity: Path, depot_data: Path, root: Path, converted: Path, asm: Path) -> Path:
+    surgery = repo / "tools/bundle-surgery/bin/Release/net8.0/BundleSurgery.dll"
+    image = root / "image"
+    catalog_out = root / "aa"
+    shutil.rmtree(image, ignore_errors=True)
+    shutil.rmtree(catalog_out, ignore_errors=True)
+    (image / "Resources").mkdir(parents=True)
+    (image / "Managed/Metadata").mkdir(parents=True)
+    (image / "Managed/Resources").mkdir(parents=True)
+
+    for name in ("globalgamemanagers.assets", "resources.assets", "sharedassets0.assets"):
+        source = depot_data / name
+        if source.is_file():
+            run(["dotnet", str(surgery), "extract-vulkan-android", str(source), str(image / name)])
+    for name in (
+        "globalgamemanagers", "level0", "boot.config", "RuntimeInitializeOnLoads.json",
+        "ScriptingAssemblies.json", "app.info", "globalgamemanagers.assets.resS", "resources.assets.resS",
+    ):
+        source = depot_data / name
+        if source.is_file():
+            shutil.copy2(source, image / name)
+    builtin = depot_data / "Resources/unity_builtin_extra"
+    if builtin.is_file():
+        shutil.copy2(builtin, image / "Resources/unity_builtin_extra")
+    engine_resources = find_android_file(unity / "android", "Data/Resources/unity default resources")
+    shutil.copy2(engine_resources, image / "Resources/unity default resources")
+
+    metadata = converted / "Metadata/global-metadata.dat"
+    shutil.copy2(metadata, image / "Managed/Metadata/global-metadata.dat")
+    resources = converted / "Resources"
+    if resources.is_dir():
+        for path in resources.iterdir():
+            if path.is_file() and path.suffix == ".dat":
+                shutil.copy2(path, image / "Managed/Resources" / path.name)
+
+    serialized = (
+        "globalgamemanagers", "level0", "globalgamemanagers.assets",
+        "resources.assets", "sharedassets0.assets",
+    )
+    for name in serialized:
+        path = image / name
+        if path.is_file():
+            run(["dotnet", str(surgery), "set-unity-version", str(path), UNITY_VERSION])
+            retarget_serialized(path)
+    if (image / "Resources/unity_builtin_extra").is_file():
+        path = image / "Resources/unity_builtin_extra"
+        run(["dotnet", str(surgery), "set-unity-version", str(path), UNITY_VERSION])
+        retarget_serialized(path)
+
+    ggm = image / "globalgamemanagers"
+    run(["dotnet", str(surgery), "set-graphics-apis", str(ggm), "21"])
+    run(["dotnet", str(surgery), "set-build-version", str(ggm), UNITY_VERSION])
+    boot = image / "boot.config"
+    if boot.is_file():
+        lines = [line for line in boot.read_text(encoding="utf-8").splitlines() if not line.startswith("scripting-backend=")]
+        boot.write_text("\n".join(lines + ["scripting-backend=il2cpp"]) + "\n", encoding="utf-8")
+
+    entrypoints = repo / "tools/silksong-patches/entrypoints.json"
+    register_patches(image, asm, entrypoints)
+    seed = sha256(metadata)
+    guid = hashlib.md5(seed.encode("ascii")).hexdigest()
+    (image / "unity_app_guid").write_text(
+        f"{guid[:8]}-{guid[8:12]}-{guid[12:16]}-{guid[16:20]}-{guid[20:]}", encoding="utf-8",
+    )
+
+    aa_source = depot_data / "StreamingAssets/aa"
+    catalog = aa_source / "catalog.bin"
+    if catalog.is_file():
+        catalog_out.mkdir(parents=True)
+        shutil.copy2(catalog, catalog_out / "catalog.bin")
+        if (aa_source / "settings.json").is_file():
+            shutil.copy2(aa_source / "settings.json", catalog_out / "settings.json")
+        run([
+            "dotnet", str(surgery), "patch-catalog-path", str(catalog_out / "catalog.bin"),
+            str(catalog_out / "catalog.bin"), CONTENT_ROOT,
+        ])
+
+    data_apk = root / "data.apk"
+    part = root / "data.apk.part"
+    part.unlink(missing_ok=True)
+    with zipfile.ZipFile(part, "w", compression=zipfile.ZIP_STORED, allowZip64=False) as archive:
+        for directory, prefix in ((image, "assets/bin/Data"), (catalog_out, "assets/aa")):
+            if not directory.is_dir():
+                continue
+            for path in sorted(p for p in directory.rglob("*") if p.is_file()):
+                archive.write(path, f"{prefix}/{path.relative_to(directory).as_posix()}")
+    part.replace(data_apk)
+    note(f"player image packed ({data_apk.stat().st_size // (1024 * 1024)} MB)")
+    return data_apk
+
+
+def dex_player(unity: Path, root: Path) -> Path:
+    source = find_android_file(unity / "android", "Variations/il2cpp/Release/Classes/classes.jar")
+    output = root / "unity-classes.jar"
+    if output.is_file() and output.stat().st_mtime_ns >= source.stat().st_mtime_ns:
+        return output
+    output.unlink(missing_ok=True)
+    d8 = Path(os.environ.get("ANDROID_HOME", "/opt/android-sdk")) / "build-tools/36.0.0/d8"
+    run([str(d8), "--release", "--min-api", "26", "--output", str(output), str(source)])
+    if not output.is_file() or output.stat().st_size == 0:
+        fail("d8 produced no Unity player dex")
+    return output
+
+
+def write_bundle(
+    output_dir: Path,
+    version: str,
+    signature: str,
+    depot_digest: str,
+    payloads: dict[str, Path],
+) -> Path:
+    manifest = {
+        "format": "1", "package": PACKAGE, "unityVersion": UNITY_VERSION,
+        "launcherSignature": signature, "depotFingerprint": depot_digest,
+        "versionName": version, "createdUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    for name, path in payloads.items():
+        key = name.replace("-", "_")
+        manifest[f"{key}.size"] = str(path.stat().st_size)
+        manifest[f"{key}.sha256"] = sha256(path)
+    manifest_text = "".join(f"{key}={value}\n" for key, value in manifest.items())
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    final = output_dir / f"SilksongAndroid-{version}-PC-Build.zip"
+    part = output_dir / (final.name + ".part")
+    part.unlink(missing_ok=True)
+    note("packing the import bundle")
+    with zipfile.ZipFile(part, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+        archive.writestr("manifest.properties", manifest_text)
+        for name, path in payloads.items():
+            archive.write(path, f"payload/{name}")
+    part.replace(final)
+    return final
+
+
+def sign_bundle(bundle: Path, keystore: Path, storepass: str, keypass: str, alias: str) -> None:
+    """Sign every bundle entry with the same certificate as the launcher APK."""
+    if not keystore.is_file():
+        fail(f"the APK signing keystore is missing: {keystore}")
+    if not alias:
+        fail("the signing key alias is empty")
+    note("signing the import bundle with the APK identity")
+    run([
+        "jarsigner", "-keystore", str(keystore),
+        "-storepass", storepass, "-keypass", keypass,
+        "-sigalg", "SHA256withRSA", "-digestalg", "SHA-256",
+        str(bundle), alias,
+    ])
+    # Do not use -strict: a deliberately self-signed local key is valid here
+    # but strict mode returns a warning exit code for it.
+    run(["jarsigner", "-verify", str(bundle)])
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repo", type=Path, required=True)
+    parser.add_argument("--depot", type=Path, required=True)
+    parser.add_argument("--unity", type=Path, required=True)
+    parser.add_argument("--cache", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--jobs", type=int, default=automatic_jobs())
+    parser.add_argument("--keystore", type=Path, required=True)
+    parser.add_argument("--storepass", required=True)
+    parser.add_argument("--keypass", required=True)
+    parser.add_argument("--key-alias", required=True)
+    args = parser.parse_args()
+    if args.jobs < 1 or args.jobs > 64:
+        fail("--jobs must be between 1 and 64")
+
+    repo = args.repo.resolve()
+    depot = args.depot.resolve()
+    unity = args.unity.resolve()
+    root = args.cache.resolve() / "game-build"
+    root.mkdir(parents=True, exist_ok=True)
+    data = find_depot_data(depot)
+    if not any((data.parent / name).is_file() for name in ("UnityPlayer.so", "Hollow Knight Silksong")):
+        fail(f"{data.parent} does not look like the Linux depot (UnityPlayer.so is missing)")
+    if (data.parent / "UnityPlayer.dll").is_file():
+        fail("the Windows depot cannot be ported; download Steam depot 1030303 for Linux")
+
+    version = (repo / "VERSION").read_text(encoding="utf-8").strip()
+    csc = ensure_roslyn(args.cache.resolve())
+    packages = compile_packages(repo, unity, data, root, csc)
+    asm = stage_assemblies(unity, data, packages, root)
+    _, converted = convert(repo, unity, root, asm, args.jobs)
+    libil2cpp = compile_native(repo, unity, root, args.jobs)
+    data_apk = build_player_image(repo, unity, data, root, converted, asm)
+    classes = dex_player(unity, root)
+    libunity = find_android_file(unity / "android", "Variations/il2cpp/Release/Libs/arm64-v8a/libunity.so")
+    libmain = find_android_file(unity / "android", "Variations/il2cpp/Release/Libs/arm64-v8a/libmain.so")
+
+    signature = launcher_signature(repo / "src/SilksongLauncher.Launcher/app/src/main/assets/ondevice")
+    bundle = write_bundle(args.output.resolve(), version, signature, depot_fingerprint(data), {
+        "libil2cpp.so": libil2cpp,
+        "libunity.so": libunity,
+        "libmain.so": libmain,
+        "data.apk": data_apk,
+        "classes.jar": classes,
+    })
+    sign_bundle(bundle, args.keystore.resolve(), args.storepass, args.keypass, args.key_alias)
+    apk = repo / "build" / f"SilksongAndroid-{version}.apk"
+    if not apk.is_file():
+        fail(f"matching launcher APK is missing: {apk}")
+    shutil.copy2(apk, args.output.resolve() / apk.name)
+
+    note("complete")
+    note(f"APK:    {args.output.resolve() / apk.name}")
+    note(f"Bundle: {bundle}")
+    note("Install that APK, keep the Linux depot on the device, then choose Import PC build.")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except subprocess.CalledProcessError as error:
+        fail(f"command failed with exit code {error.returncode}: {' '.join(error.cmd[:3])}")

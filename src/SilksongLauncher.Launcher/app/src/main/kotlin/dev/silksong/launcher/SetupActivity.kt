@@ -98,6 +98,7 @@ class SetupActivity : Activity() {
         private const val REQ_LOGIN = 1
         private const val REQ_PICK_DEPOT = 2
         private const val REQ_STORAGE = 3
+        private const val REQ_IMPORT_PC_BUILD = 4
     }
 
     private lateinit var header: TextView
@@ -109,6 +110,7 @@ class SetupActivity : Activity() {
     private lateinit var secondary: Button
     private lateinit var resetBuild: Button
     private lateinit var changeFolder: Button
+    private lateinit var importPcBuildButton: Button
     private var busy = false
     // Set by an action to explain what just happened; cleared when the next
     // one starts. Null means the state summary is shown instead.
@@ -366,8 +368,10 @@ class SetupActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.END
         }
+        importPcBuildButton = quietButton("Import PC build") { pickPcBuild() }
         resetBuild = quietButton("Reset build") { confirmClearBuild() }
         changeFolder = quietButton("Change folder") { chooseFolder() }
+        quiet.addView(importPcBuildButton)
         quiet.addView(changeFolder)
         quiet.addView(resetBuild)
         quiet.addView(quietButton("View logs") {
@@ -415,6 +419,8 @@ class SetupActivity : Activity() {
         // twice on one screen is a question about which one is different.
         changeFolder.visibility =
             if (offer && secondary.visibility != View.VISIBLE) View.VISIBLE else View.GONE
+        importPcBuildButton.visibility =
+            if (offer && haveGameFiles()) View.VISIBLE else View.GONE
     }
 
     /**
@@ -841,6 +847,11 @@ class SetupActivity : Activity() {
             onDepotPicked(if (resultCode == RESULT_OK) data?.data else null)
             return
         }
+        if (requestCode == REQ_IMPORT_PC_BUILD) {
+            if (resultCode == RESULT_OK && data?.data != null) importPcBuild(data.data!!)
+            else refresh()
+            return
+        }
         if (requestCode != REQ_LOGIN) return
         if (resultCode != RESULT_OK || data == null) {
             say("Sign-in cancelled.")
@@ -855,6 +866,92 @@ class SetupActivity : Activity() {
         val creds = TokenStore.Credentials(account, token)
         TokenStore(this).write(creds)
         offerToPort(creds)
+    }
+
+    /** Selects the compressed bundle exactly as Build-On-Windows produced it. */
+    private fun pickPcBuild() {
+        if (!haveGameFiles()) {
+            say("Choose or download the Linux game files first.")
+            return
+        }
+        val mods = Mods.dir(this)
+        if (Mods.all(mods).isNotEmpty()) {
+            say("The first PC builder supports an unmodded build only. Move the mod DLLs out, then import again.")
+            return
+        }
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(
+                Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = "application/zip"
+                    putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/zip", "application/octet-stream"))
+                },
+                REQ_IMPORT_PC_BUILD,
+            )
+        } catch (t: Throwable) {
+            LauncherLog.log("no file picker for PC build import", t)
+            say("This device could not open a ZIP picker: ${t.message}")
+        }
+    }
+
+    /** Validates, installs, retargets the device's depot, then marks readiness last. */
+    private fun importPcBuild(uri: Uri) {
+        val depot = depotDir
+        if (depot == null || PlayerImage.depotData(depot) == null) {
+            say("The Linux game files are no longer available.")
+            return
+        }
+        val out = Il2cppConverter.rootFor(this)
+        setStep(1, "Importing PC build")
+        stepCount = 1
+        setBusy(true, "", -1f, "opening the bundle")
+        runCatching { BuildKeepAliveService.start(this) }
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        scope.launch {
+            try {
+                val staged = withContext(Dispatchers.IO) {
+                    PcBuildImport.stage(
+                        this@SetupActivity, uri, depot, out, buildSignature,
+                    ) { text -> runOnUiThread { setBusy(true, text, -1f, "") } }
+                }
+                setBusy(true, "Installing the PC build", -1f, "verified")
+                withContext(Dispatchers.IO) {
+                    PcBuildImport.install(this@SetupActivity, staged, pkgDir)
+                    DepotLocation.relink(this@SetupActivity, depot)
+                }
+
+                // Only this last depot-dependent step remains on Android. It
+                // is idempotent and resumable; no compiler or Unity download
+                // is involved in an imported build.
+                MonoRuntime.stage(this@SetupActivity)
+                    .collect { setBusy(true, it.step, it.fraction, it.detail) }
+                PlayerImage.retargetContent(depot, this@SetupActivity, out, assets)
+                    .collect { setBusy(true, it.step, it.fraction, it.detail) }
+
+                withContext(Dispatchers.IO) {
+                    val mods = Mods.dir(this@SetupActivity)
+                    Mods.ensure(mods)
+                    val snapshot = Mods.snapshot(mods, assets)
+                    if (snapshot.files.isNotEmpty()) {
+                        throw java.io.IOException("The mods folder changed during import")
+                    }
+                    Mods.markConverted(out, snapshot, emptyList())
+                    Mods.markInstalled(out)
+                    BuildInstallation.complete(pkgDir, buildSignature)
+                }
+                say("The PC build is installed and ready.")
+            } catch (t: Throwable) {
+                LauncherLog.log("PC build import failed", t)
+                runCatching { withContext(Dispatchers.IO) { BuildInstallation.invalidate(pkgDir) } }
+                say("Import failed: ${t.message ?: t.javaClass.simpleName}")
+            } finally {
+                runCatching { BuildKeepAliveService.stop(this@SetupActivity) }
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                setBusy(false)
+                refresh()
+            }
+        }
     }
 
     /**

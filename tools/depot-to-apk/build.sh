@@ -6,10 +6,9 @@
 # classes, the toolchain and the user's own depot are all fetched there, and
 # libil2cpp.so is compiled there from the depot's own assemblies.
 #
-# This once did that work on a PC too, as steps 1-4 -- stage the assemblies,
-# IL -> C++, compile, build the player image. The device does all of it now,
-# so those steps were dead weight and are gone; what is left is the two steps
-# that make the APK itself.
+# The optional private PC builder reconstructs steps 1-4 outside this script:
+# stage the assemblies, IL -> C++, compile, build the player image. Keeping
+# that separate ensures this public APK path never consumes game files.
 #
 # Usage:
 #   bash tools/depot-to-apk/build.sh              # both steps
@@ -545,9 +544,9 @@ step_6_package() {
     # classes are fetched on the device, libil2cpp.so is compiled there, and
     # the player image and data package are built there. This used to be a
     # choice (ENGINE=/DATA=apk put them in the APK, external left them out)
-    # back when a PC could produce them. The PC cannot any more -- steps 1-4
-    # are gone -- so the switch had one reachable setting and is better as a
-    # property of the build than an option someone can get wrong.
+    # back when this public APK path could consume them. The optional PC
+    # builder now puts those artifacts in a separately validated private ZIP;
+    # they still never enter the published APK assembled here.
     #
     # classes.dex, classes2.dex, ... -- the launcher's dependencies push this
     # well past one file.

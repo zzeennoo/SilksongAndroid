@@ -3,8 +3,10 @@
 Assembles the APK: manifest, resources, dex, sign. **No Unity Editor, no
 decompilation.**
 
-The APK contains no game content and nothing Unity-made. It is the app that
-builds the game, and it does that on the phone.
+The published APK contains no game content and nothing Unity-made. Its normal
+path builds the game on the phone. The optional private PC builder reconstructs
+the retired stages 1–4 in Docker and emits a validated import bundle; see
+`tools/pc-builder/`.
 
 ## Why this works
 
@@ -42,10 +44,9 @@ STEPS=6 bash tools/depot-to-apk/build.sh  # repackage only
 | 5 | `apk_shell` | manifest, resources, `classes.dex` |
 | 6 | `package` | zip, align, sign |
 
-The numbering starts at 5 because steps 1-4 used to do on a PC what the device
-does now — stage the assemblies, IL → C++, compile, build the player image.
-They were removed rather than renumbered, so the names in the logs and in the
-notes below still line up with what they meant.
+The numbering starts at 5 because this script still owns only the published APK
+shell. The private PC builder now performs stages 1–4 separately, keeping
+game-derived output out of this packaging path and out of public releases.
 
 Inputs (all overridable by environment variable):
 

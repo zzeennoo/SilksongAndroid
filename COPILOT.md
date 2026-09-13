@@ -91,8 +91,12 @@ everyone who installed the last one. See the comments in
 
 ## Rebuilding the game itself
 
-The game is built **on the phone**. `make dev` only ships the app that does the
-building. To make it build the game again:
+The normal path builds the game on the phone. `make dev` only ships the app
+that does the building. A Windows/Docker path also exists for constrained
+devices; `Build-On-Windows.ps1` produces a matching APK and private import ZIP.
+See `tools/pc-builder/README.md`.
+
+To make an on-device installation build the game again:
 
 ```sh
 make game-reset   # drop the built engine and player image, then press the button

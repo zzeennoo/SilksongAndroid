@@ -18,9 +18,8 @@
 #                understands, and a JDK 25 on PATH emits major version 69,
 #                which fails the dex step with no obvious connection to the JDK.
 #   Android SDK— platform android.jar and build-tools (d8/aapt2/zipalign/
-#                apksigner). No NDK and no CMake: the launcher has no native
-#                code of its own, and the game's own libraries are compiled on
-#                the phone.
+#                apksigner). The optional `pc` target adds the pinned NDK to
+#                cross-compile libil2cpp.so for arm64.
 #   .NET 8 SDK — tools/bundle-surgery, which Gradle stages into the APK and
 #                will not build without.
 #   bsdtar     — the Android module arrives as a macOS .pkg, which is a xar
@@ -29,7 +28,7 @@
 # amd64: Google ships no Linux arm64 build-tools, so aapt2 and zipalign are
 # x86-64 ELF regardless of host. On Apple Silicon this runs under emulation.
 ARG TARGETPLATFORM=linux/amd64
-FROM --platform=linux/amd64 eclipse-temurin:17-jdk-jammy
+FROM --platform=linux/amd64 eclipse-temurin:17-jdk-jammy AS apk
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -130,3 +129,12 @@ RUN chmod +x /usr/local/bin/silksong-apk
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/silksong-apk"]
 CMD ["apk"]
+
+# The public APK and its CI do not need an NDK. Keep the large cross compiler
+# in a separate target so ordinary release builds stay exactly as lean as
+# before; Build-On-Windows.ps1 explicitly selects this stage.
+FROM apk AS pc
+RUN set -eux; \
+    printf 'y\n%.0s' $(seq 1 50) | sdkmanager --licenses >/dev/null; \
+    sdkmanager --install "ndk;27.2.12479018" >/dev/null; \
+    chmod -R a+rX "$ANDROID_HOME/ndk"

@@ -3,14 +3,14 @@
 Builds the APK inside Docker, so the only thing installed on the host is
 Docker. No Unity, no JDK, no Android SDK.
 
-This builds the *app*, not the game. The APK contains no game content and
-nothing Unity-made; it builds the game on the phone. So the container needs no
-Unity licence, no editor, and no copy of the game.
+The default target builds the *app*, not the game. The optional `pc` target
+accepts the user's private Linux depot and builds an import bundle locally.
+Neither path requires a Unity installation or licence.
 
 | | |
 | --- | --- |
 | Base image | `eclipse-temurin:17-jdk-jammy` |
-| Installed | Android SDK (platform 36, build-tools 35/36), .NET 8 SDK, bsdtar |
+| Installed | Android SDK (platform 36, build-tools 35/36), .NET 8 SDK, bsdtar; the `pc` image target adds NDK r27c |
 | Fetched at run time | Unity's Android player module, into a container volume |
 
 The JDK is pinned to 17 deliberately: d8 rejects class files newer than it
@@ -27,6 +27,10 @@ make install           # put it on the device (the container has no USB)
 
 The APK lands in `build/` on the host. The first run downloads Unity's Android
 player module (~642 MB) into a named volume; later runs reuse it.
+
+For the complete Windows flow, use the repository-root
+`Build-On-Windows.ps1` or drag the Linux depot folder onto
+`Build-On-Windows.cmd`. See [the PC builder guide](../pc-builder/README.md).
 
 For repeated builds, a container that outlives the build keeps Gradle's daemon
 and incremental state warm:

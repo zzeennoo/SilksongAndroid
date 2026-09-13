@@ -38,6 +38,10 @@ services:
         # difference between a container build being usable and being something
         # you start and walk away from. Same directory a host build uses.
         - silksong-build:/root/.cache/silksong
+        # A stable local signing identity. Without this, every fresh container
+        # creates a different key and Android refuses the next APK as an
+        # update. This contains no project or game data and stays on the PC.
+        - silksong-signing:/root/.android
         # The host's NuGet cache. bundle-surgery pins both of its packages, so
         # with them already extracted here the restore needs no network at all
         # -- which matters on a machine whose policy blocks api.nuget.org.
@@ -54,6 +58,7 @@ services:
       # depot) to the daemon on every build.
       context: .
       dockerfile: apk.Dockerfile
+      target: apk
 
     environment:
       # Skip the Gradle build when only shell/ or build.sh changed.
@@ -86,3 +91,4 @@ volumes:
   silksong-gradle:
   silksong-unity-player:
   silksong-build:
+  silksong-signing:

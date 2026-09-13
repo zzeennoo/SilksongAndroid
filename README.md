@@ -17,7 +17,7 @@ Steam integration for game files and cloud saves.
 - **Steam integration (optional)**: Sign in to Steam if you want the app to download game files and/or your Steam cloud saves for you
 - **High performance**: Compiles to native arm64 via IL2CPP and uses Vulkan shaders
 - **Fully open source and legal**: Supply your own game files either manually or through Steam sign-in (the app downloads them for you)
-- **Compilation on device**: Just download the APK and supply the game files, porting happens on device (20–30 min on a Snapdragon 8 Gen 2)
+- **Two build paths**: Port on the device, or move the memory-heavy conversion and native compile to a Windows PC
 - **Mod support (beta)**: BepInEx 5 plugins, woven into the game at build time (see [Mod support](#modsupport))
 - **QoL settings**: Skip intro, set resolution, auto upload/download cloud saves etc.
 - **Any device**: Any Android device works, single screen as well. Android 13 only for now (Android 15 is not supported at the moment)
@@ -41,6 +41,30 @@ The native compile is crash-resumable: completed objects are verified and
 reused on the next attempt. IL2CPP conversion still has to finish in one run,
 so constrained devices use its lower-peak partial-per-assembly mode and retain
 an interrupted-attempt checkpoint for safer retry settings.
+
+### Building on a Windows PC
+
+For a device with 3–4 GB of RAM, the PC path is considerably more reliable.
+It needs Docker Desktop and the same Linux depot, but no Unity installation,
+Android Studio, JDK, Android SDK or signing tools on Windows:
+
+```powershell
+.\Build-On-Windows.ps1 -Depot "D:\Games\Silksong-Linux"
+```
+
+You can also drag the depot folder onto `Build-On-Windows.cmd`. The first run
+downloads and caches the pinned build tools. It produces a matching APK and a
+`PC-Build.zip` in `pc-output/`; install that APK, copy the ZIP to the device,
+and choose **Import PC build** without extracting it. Keep the Linux depot on
+the device—the ZIP deliberately excludes its 8 GB of game content.
+
+The first PC-built APK may not install over an APK from another source because
+Android requires matching signing keys. If Android says **App not installed**,
+see the signing/data-preservation note in the [PC builder guide](tools/pc-builder/README.md)
+before uninstalling anything.
+
+The bundle is generated from your copy of the game and is for your own use;
+do not upload or redistribute it. See [the PC builder guide](tools/pc-builder/README.md).
 
 ### Supplying the game files yourself
 
@@ -158,10 +182,12 @@ tested on real hardware before release.
 
 ## Legal
 
-This repository and the APK contain **no game content and nothing Unity-made**. Silksong
-is © Team Cherry, and none of its code, art or audio is distributed here. The APK is a
-build system: it downloads Unity's toolchain, takes *your* game files (supplied by hand,
-or fetched with your own Steam account), and compiles a playable build on your own device.
+This repository and published APK contain **no game content and nothing Unity-made**.
+Silksong is © Team Cherry, and none of its code, art or audio is distributed here. The
+published APK is a build system: it downloads Unity's toolchain, takes *your* game files
+(supplied by hand, or fetched with your own Steam account), and compiles a playable build.
+The optional PC builder creates a private, game-derived bundle locally and explicitly
+does not make that bundle suitable for publication.
 
 The tooling is MIT-licensed; see [LICENSE](LICENSE). Third-party open-source
 components shipped in the APK are listed in [NOTICE.md](NOTICE.md), which also

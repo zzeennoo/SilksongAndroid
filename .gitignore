@@ -6,6 +6,8 @@ obj/
 # The built APK. Nothing else lands here -- the staging tree and the fetched
 # player module live under ~/.cache/silksong, outside the checkout.
 /build/
+/pc-output/
+__pycache__/
 
 PLAN.md
 

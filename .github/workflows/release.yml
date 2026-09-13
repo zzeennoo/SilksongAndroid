@@ -139,6 +139,7 @@ jobs:
         with:
           context: tools/docker
           file: tools/docker/apk.Dockerfile
+          target: apk
           platforms: linux/amd64
           tags: silksong-apk:latest
           load: true

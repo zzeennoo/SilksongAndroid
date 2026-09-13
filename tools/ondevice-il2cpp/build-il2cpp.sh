@@ -352,7 +352,12 @@ compile_all() {
 }
 
 
-echo "### device: $(getprop ro.product.model), $(nproc) cores, $JOBS parallel compiles"
+if command -v getprop >/dev/null 2>&1; then
+    _build_host=$(getprop ro.product.model)
+else
+    _build_host="$(uname -s)-$(uname -m)"
+fi
+echo "### device: $_build_host, $(nproc) cores, $JOBS parallel compiles"
 echo "### clang: $($CLANG --version 2>/dev/null | head -1)"
 
 T0=$(date +%s)
