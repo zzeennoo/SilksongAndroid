@@ -3,14 +3,34 @@ param(
     [string]$Depot,
 
     [Parameter(Mandatory = $false)]
-    [string]$Output = (Join-Path $PSScriptRoot "pc-output"),
+    [string]$Output,
 
     [Parameter(Mandatory = $false)]
     [ValidateRange(0, 64)]
-    [int]$Jobs = 0
+    [int]$Jobs = 0,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$ValidatePathsOnly
 )
 
 $ErrorActionPreference = "Stop"
+
+# Windows PowerShell 5 evaluates parameter default expressions before
+# $PSScriptRoot is populated in some -File/drag-and-drop invocations. Resolve
+# the script directory in the body, where both values are reliably available.
+$ScriptRoot = $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($ScriptRoot)) {
+    $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+$RepoPath = [System.IO.Path]::GetFullPath($ScriptRoot)
+if ([string]::IsNullOrWhiteSpace($Output)) {
+    $Output = Join-Path $RepoPath "pc-output"
+}
+if ($ValidatePathsOnly) {
+    Write-Output "RepoPath=$RepoPath"
+    Write-Output "OutputPath=$([System.IO.Path]::GetFullPath($Output))"
+    return
+}
 
 function Stop-Build([string]$Message) {
     Write-Host "Silksong PC build: $Message" -ForegroundColor Red
@@ -33,7 +53,6 @@ if (-not (Test-Path -LiteralPath $DepotPath -PathType Container)) {
 
 $OutputPath = [System.IO.Path]::GetFullPath($Output)
 [System.IO.Directory]::CreateDirectory($OutputPath) | Out-Null
-$RepoPath = [System.IO.Path]::GetFullPath($PSScriptRoot)
 
 Write-Host "Silksong Android PC builder" -ForegroundColor Cyan
 Write-Host "  Linux depot: $DepotPath"

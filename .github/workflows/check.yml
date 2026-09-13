@@ -13,6 +13,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  windows-wrapper:
+    runs-on: windows-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Run the wrapper in a child Windows PowerShell 5 process, matching the
+      # drag-and-drop entry point used by Build-On-Windows.cmd.
+      - name: Check Windows wrapper parameter binding
+        shell: pwsh
+        run: |
+          $missing = Join-Path $env:RUNNER_TEMP "missing-silksong-depot"
+          $result = & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File .\Build-On-Windows.ps1 -Depot $missing `
+            -ValidatePathsOnly 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "The wrapper failed: $result" }
+          if ($result -match "Cannot bind argument.*Path") {
+            throw "Build-On-Windows.ps1 still evaluates an empty script path."
+          }
+          $expected = [System.IO.Path]::GetFullPath((Join-Path $PWD "pc-output"))
+          if ($result -notmatch [regex]::Escape("OutputPath=$expected")) {
+            throw "The wrapper resolved the wrong default output: $result"
+          }
+
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 60
