@@ -96,6 +96,27 @@ class PcBuilderTests(unittest.TestCase):
             self.assertEqual(deploy, pc_builder.prepare_il2cpp(root / "unity", root / "cache"))
             self.assertTrue((deploy / "il2cpp").stat().st_mode & 0o111)
 
+    def test_pc_il2cpp_conversion_targets_android_arm64(self):
+        self.assertEqual(
+            (
+                "--platform=Android",
+                "--architecture=ARM64",
+                "--configuration=Release",
+            ),
+            pc_builder.IL2CPP_TARGET_ARGS,
+        )
+
+    def test_il2cpp_target_contract_invalidates_conversion_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "mscorlib.dll").write_bytes(b"same assemblies")
+            actual = pc_builder.tree_digest(root)
+
+            legacy = hashlib.sha256()
+            legacy.update(b"mscorlib.dll\0")
+            legacy.update(b"same assemblies")
+            self.assertNotEqual(legacy.hexdigest(), actual)
+
     def test_bundle_uses_the_importers_exact_entry_names(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

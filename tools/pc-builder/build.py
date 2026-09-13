@@ -358,8 +358,24 @@ def prepare_il2cpp(unity: Path, cache: Path) -> Path:
     return source
 
 
+IL2CPP_TARGET_ARGS = (
+    "--platform=Android",
+    "--architecture=ARM64",
+    "--configuration=Release",
+)
+
+
 def tree_digest(directory: Path) -> str:
     digest = hashlib.sha256()
+    # Conversion output is target-specific even though the input assemblies
+    # are not.  Including the target contract here prevents an older PC build
+    # (which accidentally let the Linux host choose the platform) from being
+    # accepted after the builder is fixed.  The native object cache remains
+    # content-addressed and can still reuse every generated TU that is equal.
+    digest.update(b"silksong-pc-il2cpp-v2\0")
+    for arg in IL2CPP_TARGET_ARGS:
+        digest.update(arg.encode("ascii"))
+        digest.update(b"\0")
     for path in sorted(directory.glob("*.dll"), key=lambda p: p.name):
         digest.update(path.name.encode("utf-8"))
         digest.update(b"\0")
@@ -396,7 +412,8 @@ def convert(repo: Path, unity: Path, root: Path, asm: Path, jobs: int) -> tuple[
     argv.extend((
         f"--generatedcppdir={cpp}", f"--data-folder={data}",
         "--dotnetprofile=unityaot-linux", "--emit-null-checks",
-        "--enable-array-bounds-check", "--static-lib-il2-cpp", f"--jobs={jobs}",
+        "--enable-array-bounds-check", "--static-lib-il2-cpp",
+        *IL2CPP_TARGET_ARGS, f"--jobs={jobs}",
     ))
     env = os.environ.copy()
     env["DOTNET_PROCESSOR_COUNT"] = str(jobs)

@@ -76,9 +76,10 @@ fetch_unity() {
 
 if [[ "$MODE" == il2cpp-smoke ]]; then
     # Exercise the first real conversion phase without proprietary game data.
-    # Converting mscorlib is enough to run RegisterCorlib/ICallMapping, which
-    # is exactly where an incompatible desktop host fails before game code is
-    # inspected.
+    # The full BCL reaches both RegisterCorlib/ICallMapping and platform-bound
+    # System.IO methods.  A host-only smoke test once passed while emitting a
+    # FileStream "not supported" stub; that output compiled and then aborted
+    # on Android during PathInternal's static initializer.
     fetch_unity editor
     smoke=$(mktemp -d)
     mkdir -p "$smoke/cpp" "$smoke/data"
@@ -86,16 +87,24 @@ if [[ "$MODE" == il2cpp-smoke ]]; then
     bcl="$UNITY_PLAYER_ROOT/editor/Editor/Data/MonoBleedingEdge/lib/mono/unityaot-linux"
     chmod +x "$deploy/il2cpp"
     say "smoke-testing Unity's desktop IL2CPP host"
+    mapfile -t bcl_assemblies < <(find "$bcl" -maxdepth 1 -type f -name '*.dll' | sort)
+    il2cpp_assemblies=()
+    for assembly in "${bcl_assemblies[@]}"; do
+        il2cpp_assemblies+=("--assembly=$assembly")
+    done
     (
         cd "$deploy"
         ./il2cpp --convert-to-cpp \
-            --assembly="$bcl/mscorlib.dll" \
+            "${il2cpp_assemblies[@]}" \
             --generatedcppdir="$smoke/cpp" \
             --data-folder="$smoke/data" \
             --dotnetprofile=unityaot-linux \
             --emit-null-checks \
             --enable-array-bounds-check \
             --static-lib-il2-cpp \
+            --platform=Android \
+            --architecture=ARM64 \
+            --configuration=Release \
             --jobs=1
     )
     [[ -s "$smoke/data/Metadata/global-metadata.dat" ]] || {
@@ -106,6 +115,10 @@ if [[ "$MODE" == il2cpp-smoke ]]; then
         echo "[docker] IL2CPP smoke conversion produced no native sources" >&2
         exit 2
     }
+    # Guard the exact runtime regression this smoke test is for. The platform
+    # selection controls ICallMapping; without Android here, PathInternal's
+    # FileStream constructor was emitted as il2cpp's unsupported-method stub.
+    python3 tools/pc-builder/verify-system-io.py "$smoke/cpp"
     say "desktop IL2CPP smoke conversion passed"
     exit 0
 fi
