@@ -80,6 +80,22 @@ class PcBuilderTests(unittest.TestCase):
         self.assertGreaterEqual(pc_builder.automatic_jobs(), 1)
         self.assertLessEqual(pc_builder.automatic_jobs(), 8)
 
+    def test_pc_uses_unmodified_unity_il2cpp_host(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            deploy = root / "unity/editor/Editor/Data/il2cpp/build/deploy"
+            deploy.mkdir(parents=True)
+            (deploy / "il2cpp").write_bytes(b"host")
+            (deploy / "il2cpp.dll").write_bytes(b"managed")
+            # A stale cache from the original broken PC implementation must
+            # not win over Unity's native, self-contained deployment.
+            stale = root / "cache/il2cpp-deploy"
+            stale.mkdir(parents=True)
+            (stale / ".silksong-prepared").write_text("")
+            (stale / "il2cpp.dll").write_bytes(b"old")
+            self.assertEqual(deploy, pc_builder.prepare_il2cpp(root / "unity", root / "cache"))
+            self.assertTrue((deploy / "il2cpp").stat().st_mode & 0o111)
+
     def test_bundle_uses_the_importers_exact_entry_names(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

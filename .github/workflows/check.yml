@@ -94,6 +94,15 @@ jobs:
             check-${{ hashFiles('tools/ondevice-il2cpp/fetch-unity.sh', 'src/SilksongLauncher.Launcher/**/*.kts') }}-
             check-
 
+      - name: Smoke-test desktop IL2CPP conversion
+        run: |
+          set -euo pipefail
+          mkdir -p .ci-cache/unity-player
+          docker run --rm --platform linux/amd64 \
+            -v "$PWD:/workspace" \
+            -v "$PWD/.ci-cache/unity-player:/opt/unity-player" \
+            silksong-pc-builder:check il2cpp-smoke
+
       - name: Compile APK and Android tests
         run: |
           set -euo pipefail

@@ -338,47 +338,24 @@ def stage_assemblies(unity: Path, data: Path, packages: Path, root: Path) -> Pat
 
 
 def prepare_il2cpp(unity: Path, cache: Path) -> Path:
+    """Return Unity's native Linux-x64 IL2CPP deployment.
+
+    The Android builder has to remove this deployment's private x64 CoreCLR
+    and host il2cpp.dll through its ARM64 runtime.  This builder itself runs in
+    a Linux-x64 container, however, so doing the same surgery here discards the
+    exact runtime and deps graph Unity tested together.  Use the bundled
+    self-contained apphost intact on its native platform.
+
+    ``cache`` remains in the signature because older builder caches contain a
+    prepared copy there; deliberately ignoring it prevents a failed run from
+    reusing that modified deployment.
+    """
     source = unity / "editor/Editor/Data/il2cpp/build/deploy"
-    deploy = cache / "il2cpp-deploy"
-    marker = deploy / ".silksong-prepared"
-    if marker.is_file() and (deploy / "il2cpp.dll").is_file():
-        return deploy
-    shutil.rmtree(deploy, ignore_errors=True)
-    shutil.copytree(source, deploy)
-    doomed = {
-        "System.Private.CoreLib.dll", "libcoreclr.so", "libclrjit.so", "libclrgc.so",
-        "libhostfxr.so", "libhostpolicy.so", "libmscordaccore.so", "libmscordbi.so",
-        "libcoreclrtraceptprovider.so", "createdump", "il2cpp", "il2cpp-compile",
-    }
-    for path in list(deploy.iterdir()):
-        if (
-            path.name in doomed
-            or path.name.endswith(".deps.json")
-            or path.name.endswith(".pdb")
-            or (path.name.startswith("libSystem.") and path.name.endswith(".so"))
-        ):
-            if path.is_dir():
-                shutil.rmtree(path)
-            else:
-                path.unlink()
-    (deploy / "il2cpp.runtimeconfig.json").write_text(
-        json.dumps({
-            "runtimeOptions": {
-                "tfm": "net8.0",
-                "framework": {"name": "Microsoft.NETCore.App", "version": "8.0.0"},
-                "rollForward": "latestMajor",
-                "configProperties": {
-                    "System.GC.Server": False,
-                    "System.Globalization.Invariant": True,
-                    "System.Globalization.PredefinedCulturesOnly": True,
-                    "System.Runtime.TieredCompilation.QuickJit": False,
-                },
-            }
-        }, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    marker.write_text("", encoding="utf-8")
-    return deploy
+    executable = source / "il2cpp"
+    if not executable.is_file() or not (source / "il2cpp.dll").is_file():
+        fail(f"Unity's desktop IL2CPP deployment is incomplete: {source}")
+    executable.chmod(executable.stat().st_mode | 0o111)
+    return source
 
 
 def tree_digest(directory: Path) -> str:
@@ -414,7 +391,7 @@ def convert(repo: Path, unity: Path, root: Path, asm: Path, jobs: int) -> tuple[
     cpp.mkdir(parents=True)
     data.mkdir(parents=True)
     deploy = prepare_il2cpp(unity, root)
-    argv = ["dotnet", str(deploy / "il2cpp.dll"), "--convert-to-cpp"]
+    argv = [str(deploy / "il2cpp"), "--convert-to-cpp"]
     argv.extend(f"--assembly={path}" for path in sorted(asm.glob("*.dll"), key=lambda p: p.name))
     argv.extend((
         f"--generatedcppdir={cpp}", f"--data-folder={data}",
