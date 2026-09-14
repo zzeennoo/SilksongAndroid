@@ -146,6 +146,13 @@ class PcBuilderTests(unittest.TestCase):
     def test_system_io_guard_accepts_implemented_constructor_chain(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            # IL2CPP emits references/declarations in files that sort before
+            # the implementation. The guard must continue past those rather
+            # than treating the first occurrence as the definition.
+            (root / "A_References.cpp").write_text(
+                "void FileStream__ctor_mBBBB();\n",
+                encoding="utf-8",
+            )
             (root / "System.Private.CoreLib.cpp").write_text(
                 """
                 bool PathInternal_GetIsCaseSensitive_mAAAA() {

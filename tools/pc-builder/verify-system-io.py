@@ -52,7 +52,14 @@ def verify(root: Path) -> None:
         symbol = pending.pop(0)
         if symbol in verified:
             continue
-        body = next((method_body(text, symbol) for text in texts if symbol in text), None)
+        body = None
+        for text in texts:
+            if symbol not in text:
+                continue
+            candidate = method_body(text, symbol)
+            if candidate is not None:
+                body = candidate
+                break
         if body is None:
             raise SystemExit(f"IL2CPP smoke: generated constructor definition not found: {symbol}")
         if "il2cpp_codegen_get_not_supported_exception" in body:
