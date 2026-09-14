@@ -24,6 +24,11 @@ from pathlib import Path
 UNITY_VERSION = "6000.0.50f1"
 PACKAGE = "com.jakobkhansen.silksong"
 PC_BUILD_CONTRACT = "android-full-system-io-v3"
+# v3 tightens only the linked-ELF audit.  A cached v2 generated tree has
+# already passed the complete source-graph audit and remains valid; it is the
+# native object cache that must be rebuilt.  Keep this separate from the ZIP
+# contract so fixing packaging/auditing does not repeat IL-to-C++ conversion.
+CONVERSION_CACHE_CONTRACT = "android-full-system-io-v2"
 CONTENT_ROOT = f"/data/user/0/{PACKAGE}/files/aa"
 ROSLYN_VERSION = "4.12.0"
 ROSLYN_BYTES = 21_775_071
@@ -407,7 +412,7 @@ def tree_digest(directory: Path) -> str:
     # (which accidentally let the Linux host choose the platform) from being
     # accepted after the builder is fixed.  The native object cache remains
     # content-addressed and can still reuse every generated TU that is equal.
-    digest.update(PC_BUILD_CONTRACT.encode("ascii"))
+    digest.update(CONVERSION_CACHE_CONTRACT.encode("ascii"))
     digest.update(b"\0")
     for arg in IL2CPP_TARGET_ARGS:
         digest.update(arg.encode("ascii"))

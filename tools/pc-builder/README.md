@@ -59,6 +59,10 @@ copy again and records the full digest in `PC build installed: ...`, so that log
 can be compared byte-for-byte with both PC lines and identifies bytes on the
 device rather than merely repeating a manifest value.
 
+The stricter v3 audit reuses a v2 generated C++ tree after rechecking it, but
+advances the native object-cache signature and rebuilds those objects once.
+No cache or Docker volume needs to be deleted manually.
+
 Use `-Jobs 4` to override the automatic worker count. By default the builder
 uses about one worker per 2 GiB available to Docker, capped at eight, so a
 normal Docker Desktop configuration does not overcommit memory late in IL2CPP.

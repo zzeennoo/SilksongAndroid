@@ -148,13 +148,29 @@ class PcBuilderTests(unittest.TestCase):
             current = pc_builder.tree_digest(root)
 
             previous = hashlib.sha256()
-            previous.update(b"android-full-system-io-v2\0")
+            previous.update(b"android-full-system-io-v1\0")
             for arg in pc_builder.IL2CPP_TARGET_ARGS:
                 previous.update(arg.encode("ascii"))
                 previous.update(b"\0")
             previous.update(b"mscorlib.dll\0")
             previous.update(b"same assemblies")
             self.assertNotEqual(previous.hexdigest(), current)
+
+    def test_strict_binary_guard_reuses_verified_v2_conversion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "mscorlib.dll").write_bytes(b"same assemblies")
+            current = pc_builder.tree_digest(root)
+
+            verified_v2 = hashlib.sha256()
+            verified_v2.update(b"android-full-system-io-v2\0")
+            for arg in pc_builder.IL2CPP_TARGET_ARGS:
+                verified_v2.update(arg.encode("ascii"))
+                verified_v2.update(b"\0")
+            verified_v2.update(b"mscorlib.dll\0")
+            verified_v2.update(b"same assemblies")
+            self.assertEqual(verified_v2.hexdigest(), current)
+            self.assertNotEqual(pc_builder.PC_BUILD_CONTRACT, pc_builder.CONVERSION_CACHE_CONTRACT)
 
     def test_system_io_guard_follows_delegating_constructor(self):
         with tempfile.TemporaryDirectory() as tmp:
