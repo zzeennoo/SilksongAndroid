@@ -198,10 +198,12 @@ object UnityDex {
     /**
      * Adds the dexed player classes to the app's own class loader.
      *
-     * Android's loader keeps its dex files in a private array inside
-     * BaseDexClassLoader.pathList. Appending to that array is what MultiDex
-     * did for years and what every dynamic-loading library still does: build
-     * a loader over the new dex, take the elements it made, and concatenate.
+     * Android's BaseDexClassLoader owns a DexPathList and exposes addDexPath
+     * for extending it. Add the jar through that SAME loader. Do not
+     * create a donor DexClassLoader and transplant its dex elements: ART binds
+     * a DexFile to the class loader that first owns it, and Android 8+ rejects
+     * using that object from another loader with "Attempt to register dex file
+     * ... with multiple class loaders".
      *
      * It has to be the app's loader, not a child, because the framework
      * instantiates activities through the app's loader and a parent cannot
@@ -226,31 +228,9 @@ object UnityDex {
             return
         }
         try {
-            val dexPathList = field(appLoader.javaClass, "pathList")
-                ?: return failed("BaseDexClassLoader has no pathList field")
-            val pathList = dexPathList.get(appLoader)
-                ?: return failed("the class loader's pathList is null")
-            val elementsField = field(pathList.javaClass, "dexElements")
-                ?: return failed("DexPathList has no dexElements field")
-
-            val donor = DexClassLoader(
-                jar.absolutePath,
-                File(context.cacheDir, OPT_DIR).apply { mkdirs() }.absolutePath,
-                null,
-                appLoader,
-            )
-            val donorList = field(donor.javaClass, "pathList")?.get(donor)
-                ?: return failed("the donor loader has no pathList")
-            val donorElements = elementsField.get(donorList) as? Array<*>
-                ?: return failed("the donor loader produced no dex elements")
-            val current = elementsField.get(pathList) as? Array<*>
-                ?: return failed("the app loader's dexElements is not an array")
-
-            val merged = java.lang.reflect.Array.newInstance(
-                current.javaClass.componentType!!, current.size + donorElements.size)
-            System.arraycopy(current, 0, merged, 0, current.size)
-            System.arraycopy(donorElements, 0, merged, current.size, donorElements.size)
-            elementsField.set(pathList, merged)
+            if (!addDexPath(appLoader, jar)) {
+                return failed("BaseDexClassLoader has no compatible addDexPath method")
+            }
 
             LauncherLog.log("$TAG: player classes added to the app class loader")
         } catch (t: Throwable) {
@@ -261,15 +241,35 @@ object UnityDex {
         }
     }
 
-    /**
-     * One reflection step did not find what it expected.
-     *
-     * Each of these was a bare `?: return` and so indistinguishable from
-     * success. They are all "this Android version moved a private field",
-     * which is worth knowing precisely: the step named here is the one to fix.
-     */
+    /** One platform-loader step did not find what it expected. */
     private fun failed(why: String) {
         LauncherLog.log("$TAG: could not add the player classes: $why")
+    }
+
+    /**
+     * Invokes BaseDexClassLoader.addDexPath on the app loader itself.
+     *
+     * The one-argument overload has existed since before the supported
+     * Android 8 minimum. The overload with the trust bit is retained as a
+     * small OEM/AOSP compatibility fallback; false means the external jar is
+     * not a trusted platform dex. Kept internal so ordinary JVM tests can
+     * prove both signatures without constructing Android's hidden loader.
+     */
+    internal fun addDexPath(loader: Any, jar: File): Boolean {
+        val oneArgument = method(loader.javaClass, "addDexPath", String::class.java)
+        if (oneArgument != null) {
+            oneArgument.invoke(loader, jar.absolutePath)
+            return true
+        }
+
+        val withTrust = method(
+            loader.javaClass, "addDexPath", String::class.java, java.lang.Boolean.TYPE,
+        )
+        if (withTrust != null) {
+            withTrust.invoke(loader, jar.absolutePath, false)
+            return true
+        }
+        return false
     }
 
     /**
@@ -395,13 +395,17 @@ object UnityDex {
             Class.forName(UNITY_PLAYER_CLASS, false, probe)
         }.isSuccess
 
-    /** Walks up the hierarchy, since the field is declared on a base class. */
-    private fun field(start: Class<*>, name: String): java.lang.reflect.Field? {
+    /** Finds a hidden method declared on BaseDexClassLoader or an OEM base. */
+    private fun method(
+        start: Class<*>,
+        name: String,
+        vararg parameterTypes: Class<*>,
+    ): java.lang.reflect.Method? {
         var c: Class<*>? = start
         while (c != null) {
             try {
-                return c.getDeclaredField(name).apply { isAccessible = true }
-            } catch (_: NoSuchFieldException) {
+                return c.getDeclaredMethod(name, *parameterTypes).apply { isAccessible = true }
+            } catch (_: NoSuchMethodException) {
                 c = c.superclass
             }
         }
