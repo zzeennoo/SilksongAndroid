@@ -119,6 +119,21 @@ class PcBuilderTests(unittest.TestCase):
             legacy.update(b"same assemblies")
             self.assertNotEqual(legacy.hexdigest(), actual)
 
+    def test_full_system_io_guard_invalidates_previous_target_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "mscorlib.dll").write_bytes(b"same assemblies")
+            current = pc_builder.tree_digest(root)
+
+            previous = hashlib.sha256()
+            previous.update(b"silksong-pc-il2cpp-v2\0")
+            for arg in pc_builder.IL2CPP_TARGET_ARGS:
+                previous.update(arg.encode("ascii"))
+                previous.update(b"\0")
+            previous.update(b"mscorlib.dll\0")
+            previous.update(b"same assemblies")
+            self.assertNotEqual(previous.hexdigest(), current)
+
     def test_system_io_guard_follows_delegating_constructor(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -189,6 +204,7 @@ class PcBuilderTests(unittest.TestCase):
                     set(archive.namelist()),
                 )
                 manifest = archive.read("manifest.properties").decode("ascii")
+                self.assertIn(f"pcBuildContract={pc_builder.PC_BUILD_CONTRACT}\n", manifest)
                 for name, path in payloads.items():
                     self.assertIn(f"{name}.size={path.stat().st_size}\n", manifest)
                     self.assertIn(f"{name}.sha256={pc_builder.sha256(path)}\n", manifest)

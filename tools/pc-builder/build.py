@@ -23,6 +23,7 @@ from pathlib import Path
 
 UNITY_VERSION = "6000.0.50f1"
 PACKAGE = "com.jakobkhansen.silksong"
+PC_BUILD_CONTRACT = "android-full-system-io-v1"
 CONTENT_ROOT = f"/data/user/0/{PACKAGE}/files/aa"
 ROSLYN_VERSION = "4.12.0"
 ROSLYN_BYTES = 21_775_071
@@ -365,6 +366,18 @@ IL2CPP_TARGET_ARGS = (
 )
 
 
+def verify_system_io(repo: Path, cpp: Path) -> None:
+    """Reject generated code whose first Android file probe is a stub.
+
+    The lightweight CI smoke catches converter/platform regressions in the
+    Unity class library.  The game conversion is the artifact we actually
+    ship, though, and its larger assembly graph has failed differently before.
+    Run the same guard over that exact tree before either accepting a cache or
+    spending hours compiling it.
+    """
+    run([sys.executable, str(repo / "tools/pc-builder/verify-system-io.py"), str(cpp)])
+
+
 def tree_digest(directory: Path) -> str:
     digest = hashlib.sha256()
     # Conversion output is target-specific even though the input assemblies
@@ -372,7 +385,8 @@ def tree_digest(directory: Path) -> str:
     # (which accidentally let the Linux host choose the platform) from being
     # accepted after the builder is fixed.  The native object cache remains
     # content-addressed and can still reuse every generated TU that is equal.
-    digest.update(b"silksong-pc-il2cpp-v2\0")
+    digest.update(PC_BUILD_CONTRACT.encode("ascii"))
+    digest.update(b"\0")
     for arg in IL2CPP_TARGET_ARGS:
         digest.update(arg.encode("ascii"))
         digest.update(b"\0")
@@ -399,8 +413,15 @@ def convert(repo: Path, unity: Path, root: Path, asm: Path, jobs: int) -> tuple[
         and len(list(cpp.glob("*.cpp"))) > 100
     )
     if complete:
-        note("IL2CPP conversion is current; reusing it")
-        return cpp, data
+        try:
+            verify_system_io(repo, cpp)
+        except subprocess.CalledProcessError:
+            # A previous builder could mark host-targeted output complete.
+            # Never reuse it just because the managed inputs are unchanged.
+            note("cached IL2CPP output failed the Android System.IO guard; rebuilding it")
+        else:
+            note("IL2CPP conversion is current and verified; reusing it")
+            return cpp, data
 
     shutil.rmtree(cpp, ignore_errors=True)
     shutil.rmtree(data, ignore_errors=True)
@@ -423,6 +444,7 @@ def convert(repo: Path, unity: Path, root: Path, asm: Path, jobs: int) -> tuple[
     source_count = len(list(cpp.glob("*.cpp"))) + len(list(cpp.glob("*.c")))
     if not metadata.is_file() or metadata.stat().st_size == 0 or source_count < 100:
         fail(f"IL2CPP output is incomplete ({source_count} sources, metadata={metadata.exists()})")
+    verify_system_io(repo, cpp)
     marker.write_text(signature + "\n", encoding="utf-8")
     note(f"IL2CPP produced {source_count} native sources")
     return cpp, data
@@ -629,6 +651,7 @@ def write_bundle(
 ) -> Path:
     manifest = {
         "format": "1", "package": PACKAGE, "unityVersion": UNITY_VERSION,
+        "pcBuildContract": PC_BUILD_CONTRACT,
         "launcherSignature": signature, "depotFingerprint": depot_digest,
         "versionName": version, "createdUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }

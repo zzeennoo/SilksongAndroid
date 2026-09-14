@@ -21,6 +21,7 @@ import java.util.zip.ZipFile
 object PcBuildImport {
 
     private const val FORMAT = "1"
+    private const val PC_BUILD_CONTRACT = "android-full-system-io-v1"
     private const val MANIFEST = "manifest.properties"
     private const val MAX_BUNDLE_BYTES = 1_500L * 1024L * 1024L
     private val DIGEST = Regex("[0-9a-f]{64}")
@@ -38,7 +39,11 @@ object PcBuildImport {
         Payload("classes.jar", 20L * 1024L * 1024L),
     )
 
-    data class Staged(val directory: File)
+    data class Staged(
+        val directory: File,
+        val createdUtc: String,
+        val runtimeDigest: String,
+    )
 
     /** The exact game inputs from which IL2CPP output was generated. */
     fun depotFingerprint(depot: File): String {
@@ -163,7 +168,11 @@ object PcBuildImport {
                     if (actual != expected) throw IOException("${payload.name} failed its SHA-256 check")
                 }
                 validatePayloads(staged)
-                return Staged(staged)
+                return Staged(
+                    staged,
+                    properties.getProperty("createdUtc").orEmpty(),
+                    properties.getProperty("libil2cpp.so.sha256").orEmpty(),
+                )
             }
         } catch (t: Throwable) {
             staged.deleteRecursively()
@@ -220,6 +229,12 @@ object PcBuildImport {
         if (properties.getProperty("unityVersion") != UnityFetcher.UNITY_VERSION) {
             throw IOException("This PC build targets a different Unity version")
         }
+        if (properties.getProperty("pcBuildContract") != PC_BUILD_CONTRACT) {
+            throw IOException(
+                "This PC build predates the Android System.IO runtime check. " +
+                    "Run Build-On-Windows again and import the new ZIP.",
+            )
+        }
         if (properties.getProperty("launcherSignature") != launcherSignature) {
             throw IOException("The APK and PC build do not match. Install the APK produced beside this ZIP.")
         }
@@ -271,8 +286,15 @@ object PcBuildImport {
             File(staged.directory, "classes.jar"),
             File(UnityDex.outputDir(context), "classes.jar"),
         )
+        BuildInstallation.writeAtomic(
+            File(pkgDir, ".pc-build.identity"),
+            "createdUtc=${staged.createdUtc}\nlibil2cppSha256=${staged.runtimeDigest}\n",
+        )
         staged.directory.deleteRecursively()
-        LauncherLog.log("PC build installed into the private runtime directory")
+        LauncherLog.log(
+            "PC build installed: created=${staged.createdUtc.ifEmpty { "unknown" }}, " +
+                "libil2cpp=${staged.runtimeDigest.take(16).ifEmpty { "unknown" }}",
+        )
     }
 
     private fun copyAtomic(from: File, to: File, executable: Boolean = false) {
