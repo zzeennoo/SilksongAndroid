@@ -148,7 +148,7 @@ class PcBuilderTests(unittest.TestCase):
             current = pc_builder.tree_digest(root)
 
             previous = hashlib.sha256()
-            previous.update(b"android-full-system-io-v1\0")
+            previous.update(b"android-full-system-io-v2\0")
             for arg in pc_builder.IL2CPP_TARGET_ARGS:
                 previous.update(arg.encode("ascii"))
                 previous.update(b"\0")
@@ -309,22 +309,55 @@ class PcBuilderTests(unittest.TestCase):
             }
             system_io_verifier.verify_binary_graph(analysis, defined, graph)
 
+    def test_binary_guard_rejects_a_missing_nonterminal_constructor_edge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "System.IO.cpp").write_text(
+                """
+                bool PathInternal_GetIsCaseSensitive_mAAAA() { FileStream__ctor_mBBBB(); }
+                void FileStream__ctor_mBBBB() { FileStream__ctor_mCCCC(); }
+                void FileStream__ctor_mCCCC() { open_file(); }
+                """,
+                encoding="utf-8",
+            )
+            analysis = system_io_verifier.analyze_sources(root)
+            defined = analysis["paths"] | analysis["ctors"]
+            graph = {
+                "PathInternal_GetIsCaseSensitive_mAAAA": {"FileStream__ctor_mBBBB"},
+                "FileStream__ctor_mBBBB": set(),
+                "FileStream__ctor_mCCCC": set(),
+            }
+            with self.assertRaisesRegex(SystemExit, "no visible constructor edge"):
+                system_io_verifier.verify_binary_graph(analysis, defined, graph)
+
     def test_binary_guard_parses_aarch64_objdump_branches(self):
         output = """
 0000000000010000 <PathInternal_GetIsCaseSensitive_mAAAA>:
    10000:       bl      0x10100 <FileStream__ctor_mBBBB>
 0000000000010100 <FileStream__ctor_mBBBB>:
-   10100:       b       0x10200 <FileStream__ctor_mCCCC>
+   10100:       b       <FileStream__ctor_mCCCC>
 0000000000010200 <FileStream__ctor_mCCCC>:
-   10200:       b       0x10208 <FileStream__ctor_mCCCC+0x8>
-   10204:       b       0x1020c <FileStream__ctor_mCCCC+0xc>
-   10200:       ret
+   10200:       bl      FileStream__ctor_mDDDD@plt
+0000000000010300 <FileStream__ctor_mDDDD>:
+   10300:       d65f03c0        ret
+0000000000010400 <FileStream__ctor_mEEEE>:
+   10400:       bl      0x10500
+0000000000010500 <FileStream__ctor_mFFFF>:
+   10500:       ret
+0000000000010600 <FileStream__ctor_mABAB>:
+   10600:       b       0x10608 <FileStream__ctor_mABAB+0x8>
+   10604:       b       0x1060c <FileStream__ctor_mABAB+0xc>
+   10608:       ret
 """
         self.assertEqual(
             {
                 "PathInternal_GetIsCaseSensitive_mAAAA": {"FileStream__ctor_mBBBB"},
                 "FileStream__ctor_mBBBB": {"FileStream__ctor_mCCCC"},
-                "FileStream__ctor_mCCCC": set(),
+                "FileStream__ctor_mCCCC": {"FileStream__ctor_mDDDD"},
+                "FileStream__ctor_mDDDD": set(),
+                "FileStream__ctor_mEEEE": {"FileStream__ctor_mFFFF"},
+                "FileStream__ctor_mFFFF": set(),
+                "FileStream__ctor_mABAB": set(),
             },
             system_io_verifier.parse_objdump(output),
         )
@@ -366,6 +399,66 @@ class PcBuilderTests(unittest.TestCase):
             ], capture_output=True, text=True)
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertIn("verified linked ARM64 System.IO graph", result.stdout)
+
+    @unittest.skipUnless(
+        Path(os.environ.get("ANDROID_NDK_ROOT", "/opt/android-sdk/ndk/27.2.12479018"),
+             "toolchains/llvm/prebuilt/linux-x86_64/bin/clang++").is_file(),
+        "pinned Android NDK unavailable",
+    )
+    def test_binary_guard_rejects_a_real_stale_aarch64_object(self):
+        ndk = Path(os.environ.get("ANDROID_NDK_ROOT", "/opt/android-sdk/ndk/27.2.12479018"))
+        host = ndk / "toolchains/llvm/prebuilt/linux-x86_64"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # This is the tree the audit is asked to trust: BBBB delegates to
+            # the implemented CCCC constructor, while DDDD is an unreachable
+            # platform stub that must never enter the linked path.
+            (root / "System.IO.cpp").write_text(
+                """
+                bool PathInternal_GetIsCaseSensitive_mAAAA() { FileStream__ctor_mBBBB(); }
+                void FileStream__ctor_mBBBB() { FileStream__ctor_mCCCC(); }
+                void FileStream__ctor_mCCCC() { open_file(); }
+                void FileStream__ctor_mDDDD() {
+                    il2cpp_codegen_get_not_supported_exception("FileStream");
+                }
+                """,
+                encoding="utf-8",
+            )
+            # Deliberately link a different BBBB body, mirroring the device's
+            # observed CF0 -> 158 stale-object path.  The .cc suffix keeps this
+            # fixture out of the generated-source scan.
+            linked = root / "linked.cc"
+            linked.write_text(
+                """
+                #define KEEP extern "C" __attribute__((visibility("default"), noinline, used))
+                KEEP void il2cpp_codegen_get_not_supported_exception(const char*) {}
+                KEEP void FileStream__ctor_mCCCC() {}
+                KEEP void FileStream__ctor_mDDDD() {
+                    il2cpp_codegen_get_not_supported_exception("FileStream");
+                }
+                KEEP void FileStream__ctor_mBBBB() { FileStream__ctor_mDDDD(); }
+                KEEP bool PathInternal_GetIsCaseSensitive_mAAAA() {
+                    FileStream__ctor_mBBBB();
+                    return true;
+                }
+                """,
+                encoding="utf-8",
+            )
+            binary = root / "libil2cpp.so"
+            subprocess.run([
+                str(host / "bin/clang++"), "--target=aarch64-linux-android30",
+                "-shared", "-fPIC", "-fuse-ld=lld", "-nostdlib", "-Wl,--no-undefined",
+                "-O0", str(linked), "-o", str(binary),
+            ], check=True, capture_output=True, text=True)
+            result = subprocess.run([
+                sys.executable, str(VERIFY_SYSTEM_IO), str(root),
+                "--binary", str(binary),
+                "--nm", str(host / "bin/llvm-nm"),
+                "--objdump", str(host / "bin/llvm-objdump"),
+            ], capture_output=True, text=True)
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("FileStream__ctor_mBBBB has stale constructor edge(s)", result.stderr)
+            self.assertIn("FileStream__ctor_mDDDD", result.stderr)
 
     def test_bundle_uses_the_importers_exact_entry_names(self):
         with tempfile.TemporaryDirectory() as tmp:

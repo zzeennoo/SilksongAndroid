@@ -15,6 +15,11 @@ RELEVANT_RE = re.compile(
     r"\b(?:PathInternal_GetIsCaseSensitive|FileStream__ctor)_m[0-9A-F]+\b"
 )
 UNSUPPORTED = "il2cpp_codegen_get_not_supported_exception"
+BRANCH_RE = re.compile(r"(?:^|\s)(?:b|bl)\s+(.+?)\s*$", re.IGNORECASE)
+EDGE_TARGET_RE = re.compile(
+    r"(?:PathInternal_GetIsCaseSensitive|FileStream__ctor)_m[0-9A-F]+|"
+    + re.escape(UNSUPPORTED)
+)
 
 
 def _balanced_end(text: str, start: int, opening: str, closing: str) -> int | None:
@@ -195,30 +200,64 @@ def parse_nm(output: str) -> set[str]:
 
 
 def parse_objdump(output: str) -> dict[str, set[str]]:
+    """Return named direct AArch64 b/bl edges from llvm-objdump output.
+
+    LLVM has emitted all of these operand forms across the versions used by
+    the desktop container and Android toolchain::
+
+        bl 0x10100 <FileStream__ctor_mBBBB>
+        bl <FileStream__ctor_mBBBB>
+        bl FileStream__ctor_mBBBB
+        bl 0x10100
+
+    The previous parser accepted only the first form.  In particular, the
+    last form silently erased a stale FileStream edge even though the target
+    function was present later in the same disassembly.  Indexing function
+    header addresses first lets the audit resolve that form as well.
+    """
     graph: dict[str, set[str]] = {}
     current: str | None = None
-    header = re.compile(r"^\s*[0-9A-Fa-f]+\s+<([^>]+)>:\s*$")
-    branch = re.compile(r"\b(?:b|bl)\s+(?:0x)?[0-9A-Fa-f]+\s+<([^>]+)>")
+    header = re.compile(r"^\s*([0-9A-Fa-f]+)\s+<([^>]+)>:\s*$")
+
+    address_symbols: dict[int, str] = {}
     for line in output.splitlines():
         match = header.match(line)
         if match:
-            raw = match.group(1).split("+", 1)[0].split("@", 1)[0]
+            raw = match.group(2).split("+", 1)[0].split("@", 1)[0]
+            if RELEVANT_RE.fullmatch(raw):
+                address_symbols[int(match.group(1), 16)] = raw
+
+    for line in output.splitlines():
+        match = header.match(line)
+        if match:
+            raw = match.group(2).split("+", 1)[0].split("@", 1)[0]
             current = raw if RELEVANT_RE.fullmatch(raw) else None
             if current is not None:
                 graph.setdefault(current, set())
             continue
         if current is None:
             continue
-        called = branch.search(line)
-        if called:
-            target = called.group(1).split("+", 1)[0].split("@", 1)[0]
-            # llvm-objdump labels an intra-function basic-block branch as
-            # <FunctionName+0x...>.  Once normalized, that looks like a call
-            # from a method to itself and produces a false stale-object edge.
-            # Self-branches cannot reach a different constructor; retain every
-            # inter-symbol b/bl edge so a real stale CF0 -> 158 path still fails.
-            if target != current:
-                graph[current].add(target)
+        instruction = line.split(":", 1)
+        if len(instruction) != 2:
+            continue
+        called = BRANCH_RE.search(instruction[1])
+        if called is None:
+            continue
+        operands = called.group(1)
+        named = EDGE_TARGET_RE.search(operands)
+        target = named.group(0) if named else None
+        if target is None:
+            # With symbolic operands disabled, llvm-objdump prints only the
+            # branch address.  Resolve it against the relevant headers that
+            # were collected in the first pass.
+            numeric = re.search(r"(?:^|\s)#?(?:0x)?([0-9A-Fa-f]+)\b", operands)
+            if numeric:
+                target = address_symbols.get(int(numeric.group(1), 16))
+        # llvm-objdump labels an intra-function basic-block branch as
+        # <FunctionName+0x...>.  Once normalized, that looks like a call from
+        # a method to itself.  Self-branches cannot reach another constructor.
+        if target is not None and target != current:
+            graph[current].add(target)
     return graph
 
 
@@ -272,6 +311,12 @@ def verify_binary_graph(
         actual_ctors = calls.intersection(source_ctors)
         if symbol in source_ctors:
             allowed = _transitive(source_graph, symbol)
+            if allowed and not actual_ctors:
+                raise SystemExit(
+                    f"IL2CPP binary audit: {symbol} has no visible constructor edge in the linked ELF "
+                    f"although its verified source reaches {', '.join(sorted(allowed))}; "
+                    "refusing to package an unverifiable native object"
+                )
             unexpected = actual_ctors - allowed
             if unexpected:
                 raise SystemExit(
@@ -319,6 +364,12 @@ def verify_binary(
         f"[docker] verified linked ARM64 System.IO graph: "
         f"{len(analysis['paths'])} PathInternal symbol(s), {len(analysis['reachable'])} reachable constructor(s)"
     )
+    for symbol in sorted(set(analysis["paths"]) | set(analysis["reachable"])):
+        called = sorted(
+            target for target in graph.get(symbol, set())
+            if RELEVANT_RE.fullmatch(target) or target == UNSUPPORTED
+        )
+        print(f"[docker]   linked {symbol} -> {', '.join(called) or '<implemented terminal>'}")
 
 
 def main() -> None:

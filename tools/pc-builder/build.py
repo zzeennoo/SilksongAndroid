@@ -23,7 +23,7 @@ from pathlib import Path
 
 UNITY_VERSION = "6000.0.50f1"
 PACKAGE = "com.jakobkhansen.silksong"
-PC_BUILD_CONTRACT = "android-full-system-io-v2"
+PC_BUILD_CONTRACT = "android-full-system-io-v3"
 CONTENT_ROOT = f"/data/user/0/{PACKAGE}/files/aa"
 ROSLYN_VERSION = "4.12.0"
 ROSLYN_BYTES = 21_775_071

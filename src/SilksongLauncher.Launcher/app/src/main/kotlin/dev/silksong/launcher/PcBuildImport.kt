@@ -21,7 +21,7 @@ import java.util.zip.ZipFile
 object PcBuildImport {
 
     private const val FORMAT = "1"
-    private const val PC_BUILD_CONTRACT = "android-full-system-io-v2"
+    private const val PC_BUILD_CONTRACT = "android-full-system-io-v3"
     private const val MANIFEST = "manifest.properties"
     private const val MAX_BUNDLE_BYTES = 1_500L * 1024L * 1024L
     private val DIGEST = Regex("[0-9a-f]{64}")
@@ -244,7 +244,7 @@ object PcBuildImport {
         }
         if (properties.getProperty("pcBuildContract") != PC_BUILD_CONTRACT) {
             throw IOException(
-                "This PC build predates the linked Android System.IO runtime audit. " +
+                "This PC build predates the strict linked Android System.IO runtime audit. " +
                     "Run Build-On-Windows again and import the new ZIP.",
             )
         }
@@ -318,7 +318,7 @@ object PcBuildImport {
         staged.directory.deleteRecursively()
         LauncherLog.log(
             "PC build installed: created=${staged.createdUtc.ifEmpty { "unknown" }}, " +
-                "libil2cpp=${installedDigest.take(16)}",
+                "libil2cpp=$installedDigest",
         )
     }
 

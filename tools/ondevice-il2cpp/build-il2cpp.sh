@@ -149,10 +149,16 @@ mkdir -p obj
 # FULL=1 forces everything to be rebuilt.
 MANIFEST=obj/.hashes
 FLAGSIG=obj/.flagsig
+# This is deliberately part of the object-cache signature even though it is
+# not a compiler flag.  The v2 linked-ELF audit could miss branch operand
+# formats and therefore allowed an object whose FileStream body disagreed with
+# the generated source.  Advancing the contract forces one automatic native
+# rebuild after this fix; users do not need to find or delete cache files.
+NATIVE_CACHE_CONTRACT=system-io-linked-graph-v3
 
 # Any change to the flags invalidates every object, and comparing a signature
 # is cheaper and more reliable than remembering to wipe by hand.
-sig=$(printf '%s|%s|%s|%s' "$TGT" "$DEF" "$INC" "$CXXFLAGS" | sha256sum | cut -d' ' -f1)
+sig=$(printf '%s|%s|%s|%s|%s' "$NATIVE_CACHE_CONTRACT" "$TGT" "$DEF" "$INC" "$CXXFLAGS" | sha256sum | cut -d' ' -f1)
 if [ "${FULL:-0}" = 1 ] || [ ! -f "$FLAGSIG" ] || [ "$(cat "$FLAGSIG")" != "$sig" ]; then
     [ -f "$FLAGSIG" ] && echo "### flags changed — full rebuild"
     rm -rf obj; mkdir -p obj
@@ -489,10 +495,12 @@ echo "  objects: $(ls obj/br_*.o 2>/dev/null | wc -l)  $(( $(date +%s)-T2d ))s"
 # code for types that no longer exist -- which is exactly the kind of stale
 # state that produces an internally inconsistent player.
 stale=0
-for o in obj/g*.o obj/c*.o obj/r*.o; do
+for o in obj/*.o; do
     [ -f "$o" ] || continue
-    case "$o" in obj/zgc_*|obj/zl_*) continue ;; esac
-    grep -q "^$o\$" obj/.objs 2>/dev/null || { rm -f "$o" "$o.sha256"; stale=$((stale+1)); }
+    case "$o" in
+        obj/zgc_amalgam.o|obj/zl_*.o|obj/br_*.o) continue ;;
+    esac
+    grep -Fqx "$o" obj/.objs 2>/dev/null || { rm -f "$o" "$o.sha256"; stale=$((stale+1)); }
 done
 [ "$stale" -gt 0 ] && echo "### pruned $stale stale object(s)"
 

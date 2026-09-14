@@ -55,9 +55,9 @@ the generated source graph.
 
 The final build prints `linked libil2cpp SHA-256` and `signed ZIP libil2cpp
 SHA-256`; they must be identical. The importer hashes the installed private
-copy again and records the first 16 characters in `PC build installed: ...`, so
-that log identifies bytes on the device rather than merely repeating a manifest
-value.
+copy again and records the full digest in `PC build installed: ...`, so that log
+can be compared byte-for-byte with both PC lines and identifies bytes on the
+device rather than merely repeating a manifest value.
 
 Use `-Jobs 4` to override the automatic worker count. By default the builder
 uses about one worker per 2 GiB available to Docker, capped at eight, so a
