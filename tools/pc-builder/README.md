@@ -44,12 +44,14 @@ are downloaded. Docker volumes retain them, the signing key, the generated C++
 and native objects. Later runs are incremental and APKs remain installable over
 one another because the local signing key is stable.
 
-Before native compilation, the builder reports which staged assembly owns the
-launch-critical `System.IO` types and rejects a graph with zero or multiple
-owners. It then audits every generated `PathInternal.GetIsCaseSensitive`
-definition and reachable `FileStream` constructor. After linking, the same
-audit is repeated against the ARM64 ELF symbol/call graph. A ZIP is written only
-when the linked graph matches the generated source graph.
+Before native compilation, the builder reports which staged assemblies define
+the launch-critical `System.IO` types and rejects competing `File` or
+`FileStream` core definitions. (`unityaot-linux` intentionally has private
+`PathInternal` implementations in multiple assemblies.) It then audits every
+generated `PathInternal.GetIsCaseSensitive` definition and reachable
+`FileStream` constructor. After linking, the same audit is repeated against the
+ARM64 ELF symbol/call graph. A ZIP is written only when the linked graph matches
+the generated source graph.
 
 The final build prints `linked libil2cpp SHA-256` and `signed ZIP libil2cpp
 SHA-256`; they must be identical. The importer hashes the installed private

@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -323,6 +324,44 @@ class PcBuilderTests(unittest.TestCase):
             },
             system_io_verifier.parse_objdump(output),
         )
+
+    @unittest.skipUnless(
+        Path(os.environ.get("ANDROID_NDK_ROOT", "/opt/android-sdk/ndk/27.2.12479018"),
+             "toolchains/llvm/prebuilt/linux-x86_64/bin/clang++").is_file(),
+        "pinned Android NDK unavailable",
+    )
+    def test_binary_guard_inspects_a_real_linked_aarch64_elf(self):
+        ndk = Path(os.environ.get("ANDROID_NDK_ROOT", "/opt/android-sdk/ndk/27.2.12479018"))
+        host = ndk / "toolchains/llvm/prebuilt/linux-x86_64"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "System.IO.cpp"
+            source.write_text(
+                """
+                #define KEEP extern "C" __attribute__((visibility("default"), noinline, used))
+                KEEP void FileStream__ctor_mCCCC() {}
+                KEEP void FileStream__ctor_mBBBB() { FileStream__ctor_mCCCC(); }
+                KEEP bool PathInternal_GetIsCaseSensitive_mAAAA() {
+                    FileStream__ctor_mBBBB();
+                    return true;
+                }
+                """,
+                encoding="utf-8",
+            )
+            binary = root / "libil2cpp.so"
+            subprocess.run([
+                str(host / "bin/clang++"), "--target=aarch64-linux-android30",
+                "-shared", "-fPIC", "-fuse-ld=lld", "-nostdlib", "-Wl,--no-undefined",
+                "-O0", str(source), "-o", str(binary),
+            ], check=True, capture_output=True, text=True)
+            result = subprocess.run([
+                sys.executable, str(VERIFY_SYSTEM_IO), str(root),
+                "--binary", str(binary),
+                "--nm", str(host / "bin/llvm-nm"),
+                "--objdump", str(host / "bin/llvm-objdump"),
+            ], capture_output=True, text=True)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("verified linked ARM64 System.IO graph", result.stdout)
 
     def test_bundle_uses_the_importers_exact_entry_names(self):
         with tempfile.TemporaryDirectory() as tmp:

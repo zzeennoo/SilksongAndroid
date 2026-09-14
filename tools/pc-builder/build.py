@@ -395,7 +395,7 @@ def verify_system_io(repo: Path, cpp: Path) -> None:
 
 
 def verify_managed_system_io(repo: Path, asm: Path) -> None:
-    """Require one managed owner for the System.IO types IL2CPP will convert."""
+    """Report System.IO owners and reject competing File/FileStream core types."""
     surgery = repo / "tools/bundle-surgery/bin/Release/net8.0/BundleSurgery.dll"
     run(["dotnet", str(surgery), "audit-system-io", str(asm)])
 

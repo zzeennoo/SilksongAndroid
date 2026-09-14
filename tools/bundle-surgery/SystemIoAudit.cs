@@ -3,15 +3,24 @@ using Mono.Cecil;
 namespace BundleSurgery;
 
 /// <summary>
-/// Verifies that the exact assembly graph handed to IL2CPP has one owner for
-/// each System.IO type involved in the launch-time PathInternal probe.
+/// Reports the owners of the System.IO types involved in the launch-time
+/// PathInternal probe and rejects competing core File/FileStream definitions.
 /// </summary>
 internal static class SystemIoAudit
 {
-    private static readonly string[] WatchedTypes =
+    private static readonly string[] SingleOwnerTypes =
     {
         "System.IO.File",
         "System.IO.FileStream",
+    };
+
+    private static readonly string[] MultiOwnerTypes =
+    {
+        // Unity's unityaot-linux profile intentionally carries private
+        // PathInternal implementations in mscorlib, System and
+        // System.IO.Compression.FileSystem. The generated-source audit must
+        // enumerate all of them; treating them as competing core libraries is
+        // itself a false positive.
         "System.IO.PathInternal",
     };
 
@@ -23,7 +32,8 @@ internal static class SystemIoAudit
             return 1;
         }
 
-        var owners = WatchedTypes.ToDictionary(type => type, _ => new List<string>());
+        var watchedTypes = SingleOwnerTypes.Concat(MultiOwnerTypes).ToArray();
+        var owners = watchedTypes.ToDictionary(type => type, _ => new List<string>());
         var assemblies = Directory.GetFiles(assemblyDirectory, "*.dll")
             .OrderBy(path => path, StringComparer.Ordinal)
             .ToArray();
@@ -55,16 +65,21 @@ internal static class SystemIoAudit
 
         var failed = false;
         Console.WriteLine($"[assembly-audit] inspected {assemblies.Length} staged assemblies");
-        foreach (var type in WatchedTypes)
+        foreach (var type in watchedTypes)
         {
             var found = owners[type];
             Console.WriteLine(
                 $"[assembly-audit] {type}: " +
                 (found.Count == 0 ? "NO OWNER" : string.Join("; ", found)));
-            if (found.Count != 1)
+            if (SingleOwnerTypes.Contains(type) && found.Count != 1)
             {
                 Console.Error.WriteLine(
                     $"[assembly-audit] expected exactly one implementation of {type}, found {found.Count}");
+                failed = true;
+            }
+            else if (MultiOwnerTypes.Contains(type) && found.Count == 0)
+            {
+                Console.Error.WriteLine($"[assembly-audit] expected at least one implementation of {type}");
                 failed = true;
             }
         }

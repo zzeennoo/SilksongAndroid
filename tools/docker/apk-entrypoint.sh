@@ -85,6 +85,9 @@ if [[ "$MODE" == il2cpp-smoke ]]; then
     mkdir -p "$smoke/cpp" "$smoke/data"
     deploy="$UNITY_PLAYER_ROOT/editor/Editor/Data/il2cpp/build/deploy"
     bcl="$UNITY_PLAYER_ROOT/editor/Editor/Data/MonoBleedingEdge/lib/mono/unityaot-linux"
+    say "building the managed System.IO assembly audit"
+    dotnet build -c Release tools/bundle-surgery/BundleSurgery.csproj --nologo -v quiet
+    dotnet tools/bundle-surgery/bin/Release/net8.0/BundleSurgery.dll audit-system-io "$bcl"
     chmod +x "$deploy/il2cpp"
     say "smoke-testing Unity's desktop IL2CPP host"
     mapfile -t bcl_assemblies < <(find "$bcl" -maxdepth 1 -type f -name '*.dll' | sort)
