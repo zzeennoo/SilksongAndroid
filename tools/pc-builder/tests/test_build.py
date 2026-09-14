@@ -211,6 +211,8 @@ class PcBuilderTests(unittest.TestCase):
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertIn("1 PathInternal definition(s)", result.stdout)
             self.assertIn("2 reachable constructor definition(s)", result.stdout)
+            self.assertIn("FileStream__ctor_mBBBB", result.stdout)
+            self.assertIn("FileStream__ctor_mCCCC", result.stdout)
 
     def test_system_io_guard_enumerates_every_pathinternal_definition(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -334,6 +334,9 @@ def main() -> None:
     graph: dict[str, set[str]] = analysis["graph"]  # type: ignore[assignment]
     for symbol in sorted(analysis["paths"]):
         print(f"[docker]   {symbol} [{', '.join(locations[symbol])}] -> {', '.join(sorted(graph[symbol]))}")
+    for symbol in sorted(analysis["reachable"]):
+        called = ", ".join(sorted(graph[symbol])) or "<implemented terminal>"
+        print(f"[docker]   {symbol} [{', '.join(locations[symbol])}] -> {called}")
     if args.binary is not None:
         verify_binary(args.binary, analysis, args.nm, args.objdump)
 
