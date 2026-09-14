@@ -44,6 +44,19 @@ are downloaded. Docker volumes retain them, the signing key, the generated C++
 and native objects. Later runs are incremental and APKs remain installable over
 one another because the local signing key is stable.
 
+Before native compilation, the builder reports which staged assembly owns the
+launch-critical `System.IO` types and rejects a graph with zero or multiple
+owners. It then audits every generated `PathInternal.GetIsCaseSensitive`
+definition and reachable `FileStream` constructor. After linking, the same
+audit is repeated against the ARM64 ELF symbol/call graph. A ZIP is written only
+when the linked graph matches the generated source graph.
+
+The final build prints `linked libil2cpp SHA-256` and `signed ZIP libil2cpp
+SHA-256`; they must be identical. The importer hashes the installed private
+copy again and records the first 16 characters in `PC build installed: ...`, so
+that log identifies bytes on the device rather than merely repeating a manifest
+value.
+
 Use `-Jobs 4` to override the automatic worker count. By default the builder
 uses about one worker per 2 GiB available to Docker, capped at eight, so a
 normal Docker Desktop configuration does not overcommit memory late in IL2CPP.

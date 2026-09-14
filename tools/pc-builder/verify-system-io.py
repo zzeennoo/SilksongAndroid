@@ -1,81 +1,342 @@
 #!/usr/bin/env python3
-"""Reject IL2CPP output that cannot initialize System.IO.PathInternal."""
+"""Reject generated or linked IL2CPP code with a broken System.IO path."""
 
 from __future__ import annotations
 
+import argparse
 import re
-import sys
+import subprocess
 from pathlib import Path
 
 
-def method_body(text: str, symbol: str) -> str | None:
-    """Return the balanced C++ body for a generated method definition."""
-    for match in re.finditer(rf"\b{re.escape(symbol)}\s*\([^;]*?\)\s*\{{", text, re.S):
-        start = match.end() - 1
-        depth = 0
-        for index in range(start, len(text)):
-            if text[index] == "{":
-                depth += 1
-            elif text[index] == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[start:index + 1]
+PATH_RE = re.compile(r"\b(PathInternal_GetIsCaseSensitive_m[0-9A-F]+)\s*\(")
+CTOR_RE = re.compile(r"\b(FileStream__ctor_m[0-9A-F]+)\s*\(")
+RELEVANT_RE = re.compile(
+    r"\b(?:PathInternal_GetIsCaseSensitive|FileStream__ctor)_m[0-9A-F]+\b"
+)
+UNSUPPORTED = "il2cpp_codegen_get_not_supported_exception"
+
+
+def _balanced_end(text: str, start: int, opening: str, closing: str) -> int | None:
+    """Return the index after a balanced C/C++ construct, ignoring literals/comments."""
+    depth = 0
+    state = "code"
+    index = start
+    while index < len(text):
+        char = text[index]
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+        if state == "line-comment":
+            if char == "\n":
+                state = "code"
+        elif state == "block-comment":
+            if char == "*" and next_char == "/":
+                state = "code"
+                index += 1
+        elif state in ("string", "char"):
+            if char == "\\":
+                index += 1
+            elif (state == "string" and char == '"') or (state == "char" and char == "'"):
+                state = "code"
+        elif char == "/" and next_char == "/":
+            state = "line-comment"
+            index += 1
+        elif char == "/" and next_char == "*":
+            state = "block-comment"
+            index += 1
+        elif char == '"':
+            state = "string"
+        elif char == "'":
+            state = "char"
+        elif char == opening:
+            depth += 1
+        elif char == closing:
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
     return None
 
 
-def verify(root: Path) -> None:
-    sources = sorted(root.glob("*.cpp")) + sorted(root.glob("*.c"))
-    texts = [source.read_text(encoding="utf-8", errors="replace") for source in sources]
-    path_body: str | None = None
-    for text in texts:
-        if "PathInternal_GetIsCaseSensitive" in text:
-            match = re.search(r"\b(PathInternal_GetIsCaseSensitive_m[0-9A-F]+)\s*\(", text)
-            if match:
-                path_body = method_body(text, match.group(1))
-                if path_body is not None:
-                    break
+def _skip_space_and_comments(text: str, index: int) -> int:
+    while index < len(text):
+        match = re.match(r"(?:\s+|//[^\n]*(?:\n|$)|/\*.*?\*/)", text[index:], re.S)
+        if match is None:
+            return index
+        index += match.end()
+    return index
 
-    if path_body is None:
-        raise SystemExit("IL2CPP smoke: PathInternal.GetIsCaseSensitive was not generated")
 
-    roots = re.findall(r"\b(FileStream__ctor_m[0-9A-F]+)\s*\(", path_body)
-    if not roots:
-        raise SystemExit("IL2CPP smoke: PathInternal no longer calls a recognizable FileStream constructor")
-
-    # PathInternal calls one convenience overload, which can call another.
-    # The original regression lived in that second constructor, so checking
-    # only the direct call produces a dangerously reassuring false positive.
-    # Follow every generated FileStream constructor edge until the chain ends.
-    pending = list(dict.fromkeys(roots))
-    verified: list[str] = []
-    while pending:
-        symbol = pending.pop(0)
-        if symbol in verified:
+def definitions(text: str, pattern: re.Pattern[str]) -> list[tuple[str, str, int]]:
+    """Return every real method definition, not declarations or call sites."""
+    found: list[tuple[str, str, int]] = []
+    for match in pattern.finditer(text):
+        opening = text.find("(", match.start(), match.end())
+        parameters_end = _balanced_end(text, opening, "(", ")")
+        if parameters_end is None:
             continue
-        body = None
-        for text in texts:
-            if symbol not in text:
-                continue
-            candidate = method_body(text, symbol)
-            if candidate is not None:
-                body = candidate
-                break
-        if body is None:
-            raise SystemExit(f"IL2CPP smoke: generated constructor definition not found: {symbol}")
-        if "il2cpp_codegen_get_not_supported_exception" in body:
-            chain = " -> ".join(verified + [symbol])
-            raise SystemExit(
-                f"IL2CPP smoke: {chain} reaches an unsupported-method stub; Android would abort at boot"
-            )
-        verified.append(symbol)
-        for called in re.findall(r"\b(FileStream__ctor_m[0-9A-F]+)\s*\(", body):
-            if called not in verified and called not in pending:
-                pending.append(called)
+        body_start = _skip_space_and_comments(text, parameters_end)
+        if body_start >= len(text) or text[body_start] != "{":
+            continue
+        body_end = _balanced_end(text, body_start, "{", "}")
+        if body_end is None:
+            continue
+        found.append((match.group(1), text[body_start:body_end], match.start()))
+    return found
 
-    print("[docker] verified Android System.IO constructor chain: " + " -> ".join(verified))
+
+def _transitive(graph: dict[str, set[str]], symbol: str) -> set[str]:
+    result: set[str] = set()
+    pending = list(graph.get(symbol, ()))
+    while pending:
+        called = pending.pop()
+        if called in result:
+            continue
+        result.add(called)
+        pending.extend(graph.get(called, ()))
+    return result
+
+
+def analyze_sources(root: Path) -> dict[str, object]:
+    sources = sorted(root.rglob("*.cpp")) + sorted(root.rglob("*.c"))
+    if not sources:
+        raise SystemExit(f"IL2CPP System.IO audit: no generated sources under {root}")
+
+    path_definitions: dict[str, list[tuple[Path, str, int]]] = {}
+    ctor_definitions: dict[str, list[tuple[Path, str, int]]] = {}
+    source_texts: dict[Path, str] = {}
+    for source in sources:
+        text = source.read_text(encoding="utf-8", errors="replace")
+        source_texts[source] = text
+        for symbol, body, offset in definitions(text, PATH_RE):
+            path_definitions.setdefault(symbol, []).append((source, body, offset))
+        for symbol, body, offset in definitions(text, CTOR_RE):
+            ctor_definitions.setdefault(symbol, []).append((source, body, offset))
+
+    if not path_definitions:
+        raise SystemExit("IL2CPP System.IO audit: PathInternal.GetIsCaseSensitive was not generated")
+
+    graph: dict[str, set[str]] = {}
+    direct_unsupported: set[str] = set()
+    locations: dict[str, list[str]] = {}
+    for symbol, items in {**path_definitions, **ctor_definitions}.items():
+        graph[symbol] = set()
+        locations[symbol] = []
+        for source, body, offset in items:
+            line = source_texts[source].count("\n", 0, offset) + 1
+            locations[symbol].append(f"{source.relative_to(root)}:{line}")
+            graph[symbol].update(CTOR_RE.findall(body))
+            if UNSUPPORTED in body:
+                direct_unsupported.add(symbol)
+
+    roots_without_ctor = [symbol for symbol in path_definitions if not graph[symbol]]
+    if roots_without_ctor:
+        raise SystemExit(
+            "IL2CPP System.IO audit: PathInternal definition(s) call no recognizable "
+            "FileStream constructor: " + ", ".join(sorted(roots_without_ctor))
+        )
+
+    # Resolve the union of every definition for every symbol. A second body is
+    # exactly the dangerous case: accepting the first one lets the linker pick
+    # a path the audit never saw.
+    for root_symbol in sorted(path_definitions):
+        pending = [(called, [root_symbol, called]) for called in sorted(graph[root_symbol])]
+        visited: set[str] = set()
+        while pending:
+            symbol, chain = pending.pop(0)
+            if symbol in visited:
+                continue
+            visited.add(symbol)
+            bodies = ctor_definitions.get(symbol)
+            if not bodies:
+                raise SystemExit(
+                    "IL2CPP System.IO audit: generated constructor definition not found: "
+                    f"{' -> '.join(chain)}"
+                )
+            if symbol in direct_unsupported:
+                where = ", ".join(locations[symbol])
+                raise SystemExit(
+                    "IL2CPP System.IO audit: " + " -> ".join(chain) +
+                    f" reaches an unsupported-method stub at {where}; Android would abort at boot"
+                )
+            for called in sorted(graph[symbol]):
+                pending.append((called, chain + [called]))
+
+    # Mark every constructor that is or can reach an unsupported stub. The
+    # linked-binary pass uses this even for constructors not reached by the
+    # generated source graph, because a stale object can introduce a new edge.
+    unsafe = set(direct_unsupported)
+    changed = True
+    while changed:
+        changed = False
+        for symbol in ctor_definitions:
+            if symbol not in unsafe and graph[symbol].intersection(unsafe):
+                unsafe.add(symbol)
+                changed = True
+
+    reachable = set()
+    for symbol in path_definitions:
+        reachable.update(_transitive(graph, symbol))
+    return {
+        "paths": set(path_definitions),
+        "ctors": set(ctor_definitions),
+        "graph": graph,
+        "unsafe": unsafe,
+        "reachable": reachable,
+        "locations": locations,
+        "path_definition_count": sum(map(len, path_definitions.values())),
+        "reachable_definition_count": sum(
+            len(ctor_definitions[symbol]) for symbol in reachable if symbol in ctor_definitions
+        ),
+    }
+
+
+def parse_nm(output: str) -> set[str]:
+    return set(RELEVANT_RE.findall(output))
+
+
+def parse_objdump(output: str) -> dict[str, set[str]]:
+    graph: dict[str, set[str]] = {}
+    current: str | None = None
+    header = re.compile(r"^\s*[0-9A-Fa-f]+\s+<([^>]+)>:\s*$")
+    branch = re.compile(r"\b(?:b|bl)\s+(?:0x)?[0-9A-Fa-f]+\s+<([^>]+)>")
+    for line in output.splitlines():
+        match = header.match(line)
+        if match:
+            raw = match.group(1).split("+", 1)[0].split("@", 1)[0]
+            current = raw if RELEVANT_RE.fullmatch(raw) else None
+            if current is not None:
+                graph.setdefault(current, set())
+            continue
+        if current is None:
+            continue
+        called = branch.search(line)
+        if called:
+            graph[current].add(called.group(1).split("+", 1)[0].split("@", 1)[0])
+    return graph
+
+
+def verify_binary_graph(
+    analysis: dict[str, object],
+    defined: set[str],
+    binary_graph: dict[str, set[str]],
+) -> None:
+    source_paths: set[str] = analysis["paths"]  # type: ignore[assignment]
+    source_ctors: set[str] = analysis["ctors"]  # type: ignore[assignment]
+    source_graph: dict[str, set[str]] = analysis["graph"]  # type: ignore[assignment]
+    unsafe: set[str] = analysis["unsafe"]  # type: ignore[assignment]
+
+    binary_paths = {symbol for symbol in defined if symbol.startswith("PathInternal_GetIsCaseSensitive_m")}
+    binary_ctors = {symbol for symbol in defined if symbol.startswith("FileStream__ctor_m")}
+    if binary_paths != source_paths:
+        raise SystemExit(
+            "IL2CPP binary audit: PathInternal symbols differ from generated source "
+            f"(only-source={sorted(source_paths - binary_paths)}, only-binary={sorted(binary_paths - source_paths)})"
+        )
+    if binary_ctors != source_ctors:
+        raise SystemExit(
+            "IL2CPP binary audit: FileStream constructor symbols differ from generated source "
+            f"(only-source={sorted(source_ctors - binary_ctors)}, only-binary={sorted(binary_ctors - source_ctors)})"
+        )
+
+    for root in sorted(source_paths):
+        if root not in binary_graph:
+            raise SystemExit(f"IL2CPP binary audit: objdump did not disassemble {root}")
+        allowed = _transitive(source_graph, root)
+        actual = {called for called in binary_graph[root] if called in source_ctors}
+        if not actual:
+            raise SystemExit(f"IL2CPP binary audit: {root} has no visible FileStream call in the linked ELF")
+        unexpected = actual - allowed
+        if unexpected:
+            raise SystemExit(
+                f"IL2CPP binary audit: {root} calls constructor(s) absent from its verified source path: "
+                + ", ".join(sorted(unexpected))
+            )
+
+    pending = list(source_paths)
+    reached: set[str] = set()
+    while pending:
+        symbol = pending.pop()
+        if symbol in reached:
+            continue
+        reached.add(symbol)
+        calls = binary_graph.get(symbol, set())
+        if any(UNSUPPORTED in called for called in calls):
+            raise SystemExit(f"IL2CPP binary audit: {symbol} calls {UNSUPPORTED} in the linked ELF")
+        actual_ctors = calls.intersection(source_ctors)
+        if symbol in source_ctors:
+            allowed = _transitive(source_graph, symbol)
+            unexpected = actual_ctors - allowed
+            if unexpected:
+                raise SystemExit(
+                    f"IL2CPP binary audit: {symbol} has stale constructor edge(s): "
+                    + ", ".join(sorted(unexpected))
+                )
+        bad = actual_ctors.intersection(unsafe)
+        if bad:
+            raise SystemExit(
+                f"IL2CPP binary audit: {symbol} reaches source-audited unsupported constructor(s): "
+                + ", ".join(sorted(bad))
+            )
+        pending.extend(actual_ctors)
+
+
+def verify_binary(
+    binary: Path,
+    analysis: dict[str, object],
+    nm: Path,
+    objdump: Path,
+) -> None:
+    nm_run = subprocess.run(
+        [str(nm), "--defined-only", "--format=just-symbols", str(binary)],
+        text=True, capture_output=True,
+    )
+    if nm_run.returncode != 0:
+        raise SystemExit(f"IL2CPP binary audit: llvm-nm failed: {nm_run.stderr.strip()}")
+    defined = parse_nm(nm_run.stdout)
+    wanted = sorted(defined)
+    if not wanted:
+        raise SystemExit("IL2CPP binary audit: linked ELF exposes no System.IO symbols")
+
+    objdump_run = subprocess.run(
+        [
+            str(objdump), "--disassemble", "--no-show-raw-insn",
+            "--disassemble-symbols=" + ",".join(wanted), str(binary),
+        ],
+        text=True, capture_output=True,
+    )
+    if objdump_run.returncode != 0:
+        raise SystemExit(f"IL2CPP binary audit: llvm-objdump failed: {objdump_run.stderr.strip()}")
+    graph = parse_objdump(objdump_run.stdout)
+    verify_binary_graph(analysis, defined, graph)
+    print(
+        f"[docker] verified linked ARM64 System.IO graph: "
+        f"{len(analysis['paths'])} PathInternal symbol(s), {len(analysis['reachable'])} reachable constructor(s)"
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("generated_cpp_dir", type=Path)
+    parser.add_argument("--binary", type=Path)
+    parser.add_argument("--nm", type=Path)
+    parser.add_argument("--objdump", type=Path)
+    args = parser.parse_args()
+    if args.binary is not None and (args.nm is None or args.objdump is None):
+        parser.error("--binary requires --nm and --objdump")
+
+    analysis = analyze_sources(args.generated_cpp_dir)
+    print(
+        f"[docker] verified generated System.IO graph: "
+        f"{analysis['path_definition_count']} PathInternal definition(s), "
+        f"{analysis['reachable_definition_count']} reachable constructor definition(s)"
+    )
+    locations: dict[str, list[str]] = analysis["locations"]  # type: ignore[assignment]
+    graph: dict[str, set[str]] = analysis["graph"]  # type: ignore[assignment]
+    for symbol in sorted(analysis["paths"]):
+        print(f"[docker]   {symbol} [{', '.join(locations[symbol])}] -> {', '.join(sorted(graph[symbol]))}")
+    if args.binary is not None:
+        verify_binary(args.binary, analysis, args.nm, args.objdump)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        raise SystemExit(f"usage: {Path(sys.argv[0]).name} GENERATED_CPP_DIR")
-    verify(Path(sys.argv[1]))
+    main()

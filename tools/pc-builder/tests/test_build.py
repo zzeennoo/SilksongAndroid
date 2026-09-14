@@ -16,6 +16,10 @@ SPEC = importlib.util.spec_from_file_location("pc_builder", MODULE_PATH)
 pc_builder = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(pc_builder)
+VERIFY_SPEC = importlib.util.spec_from_file_location("system_io_verifier", VERIFY_SYSTEM_IO)
+system_io_verifier = importlib.util.module_from_spec(VERIFY_SPEC)
+assert VERIFY_SPEC.loader is not None
+VERIFY_SPEC.loader.exec_module(system_io_verifier)
 
 
 class PcBuilderTests(unittest.TestCase):
@@ -48,6 +52,23 @@ class PcBuilderTests(unittest.TestCase):
             before = pc_builder.depot_fingerprint(data)
             (data / "Managed/A.dll").write_bytes(b"b")
             self.assertNotEqual(before, pc_builder.depot_fingerprint(data))
+
+    def test_staging_excludes_non_unityaot_core_libraries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            unity = root / "unity"
+            bcl = unity / "editor/Editor/Data/MonoBleedingEdge/lib/mono/unityaot-linux"
+            engine = unity / "android/Variations/il2cpp/Managed"
+            managed = root / "game/Managed"
+            packages = root / "packages"
+            for directory in (bcl, engine, managed, packages):
+                directory.mkdir(parents=True)
+            (bcl / "mscorlib.dll").write_bytes(b"unityaot")
+            (engine / "System.Private.CoreLib.dll").write_bytes(b"competing")
+            (managed / "Assembly-CSharp.dll").write_bytes(b"game")
+            staged = pc_builder.stage_assemblies(unity, root / "game", packages, root / "work")
+            self.assertEqual(b"unityaot", (staged / "mscorlib.dll").read_bytes())
+            self.assertFalse((staged / "System.Private.CoreLib.dll").exists())
 
     def test_register_patches_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -126,7 +147,7 @@ class PcBuilderTests(unittest.TestCase):
             current = pc_builder.tree_digest(root)
 
             previous = hashlib.sha256()
-            previous.update(b"silksong-pc-il2cpp-v2\0")
+            previous.update(b"android-full-system-io-v1\0")
             for arg in pc_builder.IL2CPP_TARGET_ARGS:
                 previous.update(arg.encode("ascii"))
                 previous.update(b"\0")
@@ -187,7 +208,121 @@ class PcBuilderTests(unittest.TestCase):
                 text=True, capture_output=True,
             )
             self.assertEqual(0, result.returncode, result.stderr)
-            self.assertIn("FileStream__ctor_mBBBB -> FileStream__ctor_mCCCC", result.stdout)
+            self.assertIn("1 PathInternal definition(s)", result.stdout)
+            self.assertIn("2 reachable constructor definition(s)", result.stdout)
+
+    def test_system_io_guard_enumerates_every_pathinternal_definition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Safe.cpp").write_text(
+                """
+                bool PathInternal_GetIsCaseSensitive_mAAAA() { FileStream__ctor_mBBBB(); }
+                void FileStream__ctor_mBBBB() { open_file(); }
+                """,
+                encoding="utf-8",
+            )
+            (root / "Unsafe.cpp").write_text(
+                """
+                bool PathInternal_GetIsCaseSensitive_mDDDD() { FileStream__ctor_mEEEE(); }
+                void FileStream__ctor_mEEEE() {
+                    il2cpp_codegen_get_not_supported_exception("FileStream");
+                }
+                """,
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [sys.executable, str(VERIFY_SYSTEM_IO), str(root)],
+                text=True, capture_output=True,
+            )
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("PathInternal_GetIsCaseSensitive_mDDDD -> FileStream__ctor_mEEEE", result.stderr)
+            self.assertIn("Unsafe.cpp", result.stderr)
+
+    def test_system_io_guard_checks_every_definition_of_one_constructor_symbol(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "A_Safe.cpp").write_text(
+                """
+                bool PathInternal_GetIsCaseSensitive_mAAAA() { FileStream__ctor_mBBBB(); }
+                void FileStream__ctor_mBBBB() { open_file(); }
+                """,
+                encoding="utf-8",
+            )
+            (root / "Z_Unsafe.cpp").write_text(
+                """
+                void FileStream__ctor_mBBBB() {
+                    il2cpp_codegen_get_not_supported_exception("FileStream");
+                }
+                """,
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [sys.executable, str(VERIFY_SYSTEM_IO), str(root)],
+                text=True, capture_output=True,
+            )
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("Z_Unsafe.cpp", result.stderr)
+
+    def test_binary_guard_rejects_an_edge_not_present_in_verified_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "System.IO.cpp").write_text(
+                """
+                bool PathInternal_GetIsCaseSensitive_mAAAA() { FileStream__ctor_mBBBB(); }
+                void FileStream__ctor_mBBBB() { FileStream__ctor_mCCCC(); }
+                void FileStream__ctor_mCCCC() { open_file(); }
+                void FileStream__ctor_mDDDD() {
+                    il2cpp_codegen_get_not_supported_exception("FileStream");
+                }
+                """,
+                encoding="utf-8",
+            )
+            analysis = system_io_verifier.analyze_sources(root)
+            defined = analysis["paths"] | analysis["ctors"]
+            graph = {
+                "PathInternal_GetIsCaseSensitive_mAAAA": {"FileStream__ctor_mDDDD"},
+                "FileStream__ctor_mDDDD": {system_io_verifier.UNSUPPORTED},
+            }
+            with self.assertRaisesRegex(SystemExit, "absent from its verified source path"):
+                system_io_verifier.verify_binary_graph(analysis, defined, graph)
+
+    def test_binary_guard_accepts_the_verified_linked_graph(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "System.IO.cpp").write_text(
+                """
+                bool PathInternal_GetIsCaseSensitive_mAAAA() { FileStream__ctor_mBBBB(); }
+                void FileStream__ctor_mBBBB() { FileStream__ctor_mCCCC(); }
+                void FileStream__ctor_mCCCC() { open_file(); }
+                """,
+                encoding="utf-8",
+            )
+            analysis = system_io_verifier.analyze_sources(root)
+            defined = analysis["paths"] | analysis["ctors"]
+            graph = {
+                "PathInternal_GetIsCaseSensitive_mAAAA": {"FileStream__ctor_mBBBB"},
+                "FileStream__ctor_mBBBB": {"FileStream__ctor_mCCCC"},
+                "FileStream__ctor_mCCCC": set(),
+            }
+            system_io_verifier.verify_binary_graph(analysis, defined, graph)
+
+    def test_binary_guard_parses_aarch64_objdump_branches(self):
+        output = """
+0000000000010000 <PathInternal_GetIsCaseSensitive_mAAAA>:
+   10000:       bl      0x10100 <FileStream__ctor_mBBBB>
+0000000000010100 <FileStream__ctor_mBBBB>:
+   10100:       b       0x10200 <FileStream__ctor_mCCCC>
+0000000000010200 <FileStream__ctor_mCCCC>:
+   10200:       ret
+"""
+        self.assertEqual(
+            {
+                "PathInternal_GetIsCaseSensitive_mAAAA": {"FileStream__ctor_mBBBB"},
+                "FileStream__ctor_mBBBB": {"FileStream__ctor_mCCCC"},
+                "FileStream__ctor_mCCCC": set(),
+            },
+            system_io_verifier.parse_objdump(output),
+        )
 
     def test_bundle_uses_the_importers_exact_entry_names(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -208,6 +343,20 @@ class PcBuilderTests(unittest.TestCase):
                 for name, path in payloads.items():
                     self.assertIn(f"{name}.size={path.stat().st_size}\n", manifest)
                     self.assertIn(f"{name}.sha256={pc_builder.sha256(path)}\n", manifest)
+            pc_builder.verify_bundle_payloads(bundle, payloads)
+
+    def test_bundle_verification_rejects_a_payload_different_from_the_built_library(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payloads = {}
+            for name in ("libil2cpp.so", "libunity.so", "libmain.so", "data.apk", "classes.jar"):
+                path = root / name
+                path.write_bytes((name + "\n").encode())
+                payloads[name] = path
+            bundle = pc_builder.write_bundle(root / "out", "1.2.3", "2|signature", "a" * 64, payloads)
+            payloads["libil2cpp.so"].write_bytes(b"different linked library")
+            with self.assertRaisesRegex(SystemExit, "signed bundle payload mismatch for libil2cpp.so"):
+                pc_builder.verify_bundle_payloads(bundle, payloads)
 
     @unittest.skipUnless(shutil.which("keytool") and shutil.which("jarsigner"), "JDK signing tools unavailable")
     def test_bundle_can_be_signed_and_verified(self):

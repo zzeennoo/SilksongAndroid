@@ -23,7 +23,7 @@ from pathlib import Path
 
 UNITY_VERSION = "6000.0.50f1"
 PACKAGE = "com.jakobkhansen.silksong"
-PC_BUILD_CONTRACT = "android-full-system-io-v1"
+PC_BUILD_CONTRACT = "android-full-system-io-v2"
 CONTENT_ROOT = f"/data/user/0/{PACKAGE}/files/aa"
 ROSLYN_VERSION = "4.12.0"
 ROSLYN_BYTES = 21_775_071
@@ -35,6 +35,7 @@ ROSLYN_FILES = (
     "Microsoft.CodeAnalysis.CSharp.dll",
 )
 TEXT_EXTENSIONS = {"cs", "json", "sh", "txt", "rsp", "xml", "md"}
+CORE_LIBRARY_FILES = {"mscorlib.dll", "system.private.corelib.dll"}
 
 
 def note(message: str) -> None:
@@ -327,13 +328,28 @@ def stage_assemblies(unity: Path, data: Path, packages: Path, root: Path) -> Pat
         unity / "android/Variations/il2cpp/Managed",
         data / "Managed",
     )
-    for directory in sources:
+    excluded_corelibs: list[Path] = []
+    for index, directory in enumerate(sources):
         for dll in sorted(directory.glob("*.dll"), key=lambda p: p.name):
+            # The unityaot BCL is the conversion profile's one core library.
+            # Filename de-duplication already rejects the depot's mscorlib,
+            # but System.Private.CoreLib has a different filename while
+            # defining the same System.IO types. Passing both lets IL2CPP emit
+            # two PathInternal implementations and makes the linked choice
+            # dependent on assembly/object order.
+            if index > 0 and dll.name.casefold() in CORE_LIBRARY_FILES:
+                excluded_corelibs.append(dll)
+                continue
             target = asm / dll.name
             if not target.exists():
                 shutil.copy2(dll, target)
     for dll in sorted(packages.glob("*.dll"), key=lambda p: p.name):
         shutil.copy2(dll, asm / dll.name)
+    if excluded_corelibs:
+        note(
+            "excluded competing core library file(s): "
+            + ", ".join(str(path) for path in excluded_corelibs)
+        )
     note(f"staged {len(list(asm.glob('*.dll')))} IL2CPP assemblies")
     return asm
 
@@ -367,7 +383,7 @@ IL2CPP_TARGET_ARGS = (
 
 
 def verify_system_io(repo: Path, cpp: Path) -> None:
-    """Reject generated code whose first Android file probe is a stub.
+    """Reject generated code when any Android file-probe path is a stub.
 
     The lightweight CI smoke catches converter/platform regressions in the
     Unity class library.  The game conversion is the artifact we actually
@@ -376,6 +392,12 @@ def verify_system_io(repo: Path, cpp: Path) -> None:
     spending hours compiling it.
     """
     run([sys.executable, str(repo / "tools/pc-builder/verify-system-io.py"), str(cpp)])
+
+
+def verify_managed_system_io(repo: Path, asm: Path) -> None:
+    """Require one managed owner for the System.IO types IL2CPP will convert."""
+    surgery = repo / "tools/bundle-surgery/bin/Release/net8.0/BundleSurgery.dll"
+    run(["dotnet", str(surgery), "audit-system-io", str(asm)])
 
 
 def tree_digest(directory: Path) -> str:
@@ -402,6 +424,7 @@ def convert(repo: Path, unity: Path, root: Path, asm: Path, jobs: int) -> tuple[
     weaver = repo / "tools/mod-weaver/bin/Release/net8.0/ModWeaver.dll"
     run(["dotnet", str(surgery), "redirect-file-replace", str(asm / "Assembly-CSharp.dll"), str(asm / "SilksongIo.dll")])
     run(["dotnet", str(weaver), "builtin", "--assemblies", str(asm)])
+    verify_managed_system_io(repo, asm)
 
     cpp = root / "cpp"
     data = root / "data"
@@ -480,6 +503,14 @@ def compile_native(repo: Path, unity: Path, root: Path, jobs: int) -> Path:
     output = root / "libil2cpp.so"
     if not output.is_file() or output.stat().st_size < 10 * 1024 * 1024:
         fail("native link produced no plausible libil2cpp.so")
+    verifier = repo / "tools/pc-builder/verify-system-io.py"
+    run([
+        sys.executable, str(verifier), str(root / "cpp"),
+        "--binary", str(output),
+        "--nm", str(host / "bin/llvm-nm"),
+        "--objdump", str(host / "bin/llvm-objdump"),
+    ])
+    note(f"linked libil2cpp SHA-256: {sha256(output)}")
     return output
 
 
@@ -674,6 +705,30 @@ def write_bundle(
     return final
 
 
+def verify_bundle_payloads(bundle: Path, payloads: dict[str, Path]) -> None:
+    """Prove the final ZIP still contains the exact files whose hashes it declares."""
+    with zipfile.ZipFile(bundle) as archive:
+        properties = {}
+        for line in archive.read("manifest.properties").decode("ascii").splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                properties[key] = value
+        for name, built in payloads.items():
+            expected = sha256(built)
+            declared = properties.get(f"{name.replace('-', '_')}.sha256")
+            digest = hashlib.sha256()
+            with archive.open(f"payload/{name}") as stream:
+                for chunk in iter(lambda: stream.read(1 << 20), b""):
+                    digest.update(chunk)
+            archived = digest.hexdigest()
+            if declared != expected or archived != expected:
+                fail(
+                    f"signed bundle payload mismatch for {name}: "
+                    f"built={expected}, manifest={declared}, zip={archived}"
+                )
+    note(f"signed ZIP libil2cpp SHA-256: {sha256(payloads['libil2cpp.so'])}")
+
+
 def sign_bundle(bundle: Path, keystore: Path, storepass: str, keypass: str, alias: str) -> None:
     """Sign every bundle entry with the same certificate as the launcher APK."""
     if not keystore.is_file():
@@ -731,14 +786,18 @@ def main() -> int:
     libmain = find_android_file(unity / "android", "Variations/il2cpp/Release/Libs/arm64-v8a/libmain.so")
 
     signature = launcher_signature(repo / "src/SilksongLauncher.Launcher/app/src/main/assets/ondevice")
-    bundle = write_bundle(args.output.resolve(), version, signature, depot_fingerprint(data), {
+    payloads = {
         "libil2cpp.so": libil2cpp,
         "libunity.so": libunity,
         "libmain.so": libmain,
         "data.apk": data_apk,
         "classes.jar": classes,
-    })
+    }
+    bundle = write_bundle(
+        args.output.resolve(), version, signature, depot_fingerprint(data), payloads,
+    )
     sign_bundle(bundle, args.keystore.resolve(), args.storepass, args.keypass, args.key_alias)
+    verify_bundle_payloads(bundle, payloads)
     apk = repo / "build" / f"SilksongAndroid-{version}.apk"
     if not apk.is_file():
         fail(f"matching launcher APK is missing: {apk}")

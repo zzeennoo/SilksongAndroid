@@ -21,7 +21,7 @@ import java.util.zip.ZipFile
 object PcBuildImport {
 
     private const val FORMAT = "1"
-    private const val PC_BUILD_CONTRACT = "android-full-system-io-v1"
+    private const val PC_BUILD_CONTRACT = "android-full-system-io-v2"
     private const val MANIFEST = "manifest.properties"
     private const val MAX_BUNDLE_BYTES = 1_500L * 1024L * 1024L
     private val DIGEST = Regex("[0-9a-f]{64}")
@@ -214,6 +214,19 @@ object PcBuildImport {
         MessageDigest.getInstance("SHA-256").digest(bytes)
             .joinToString("") { "%02x".format(it) }
 
+    private fun digest(file: File): String {
+        val value = MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(1 shl 20)
+        file.inputStream().use { input ->
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                value.update(buffer, 0, count)
+            }
+        }
+        return value.digest().joinToString("") { "%02x".format(it) }
+    }
+
     private fun validateManifest(
         context: Context,
         properties: Properties,
@@ -231,7 +244,7 @@ object PcBuildImport {
         }
         if (properties.getProperty("pcBuildContract") != PC_BUILD_CONTRACT) {
             throw IOException(
-                "This PC build predates the Android System.IO runtime check. " +
+                "This PC build predates the linked Android System.IO runtime audit. " +
                     "Run Build-On-Windows again and import the new ZIP.",
             )
         }
@@ -286,14 +299,26 @@ object PcBuildImport {
             File(staged.directory, "classes.jar"),
             File(UnityDex.outputDir(context), "classes.jar"),
         )
+        // The digest validated while reading the signed ZIP is not enough for
+        // the identity log: prove the file in the executable private runtime
+        // directory is still that exact payload after the atomic copy.
+        val installedRuntime = File(engine, "libil2cpp.so")
+        val installedDigest = digest(installedRuntime)
+        if (installedDigest != staged.runtimeDigest) {
+            BuildInstallation.invalidate(pkgDir)
+            throw IOException(
+                "Installed libil2cpp.so failed its final SHA-256 check " +
+                    "(expected ${staged.runtimeDigest}, got $installedDigest)",
+            )
+        }
         BuildInstallation.writeAtomic(
             File(pkgDir, ".pc-build.identity"),
-            "createdUtc=${staged.createdUtc}\nlibil2cppSha256=${staged.runtimeDigest}\n",
+            "createdUtc=${staged.createdUtc}\nlibil2cppSha256=$installedDigest\n",
         )
         staged.directory.deleteRecursively()
         LauncherLog.log(
             "PC build installed: created=${staged.createdUtc.ifEmpty { "unknown" }}, " +
-                "libil2cpp=${staged.runtimeDigest.take(16).ifEmpty { "unknown" }}",
+                "libil2cpp=${installedDigest.take(16)}",
         )
     }
 
