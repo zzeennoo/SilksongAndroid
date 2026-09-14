@@ -316,6 +316,8 @@ class PcBuilderTests(unittest.TestCase):
 0000000000010100 <FileStream__ctor_mBBBB>:
    10100:       b       0x10200 <FileStream__ctor_mCCCC>
 0000000000010200 <FileStream__ctor_mCCCC>:
+   10200:       b       0x10208 <FileStream__ctor_mCCCC+0x8>
+   10204:       b       0x1020c <FileStream__ctor_mCCCC+0xc>
    10200:       ret
 """
         self.assertEqual(

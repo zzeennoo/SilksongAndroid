@@ -211,7 +211,14 @@ def parse_objdump(output: str) -> dict[str, set[str]]:
             continue
         called = branch.search(line)
         if called:
-            graph[current].add(called.group(1).split("+", 1)[0].split("@", 1)[0])
+            target = called.group(1).split("+", 1)[0].split("@", 1)[0]
+            # llvm-objdump labels an intra-function basic-block branch as
+            # <FunctionName+0x...>.  Once normalized, that looks like a call
+            # from a method to itself and produces a false stale-object edge.
+            # Self-branches cannot reach a different constructor; retain every
+            # inter-symbol b/bl edge so a real stale CF0 -> 158 path still fails.
+            if target != current:
+                graph[current].add(target)
     return graph
 
 
