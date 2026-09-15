@@ -134,7 +134,16 @@ CMD ["apk"]
 # in a separate target so ordinary release builds stay exactly as lean as
 # before; Build-On-Windows.ps1 explicitly selects this stage.
 FROM apk AS pc
+ARG SPIRV_CROSS_COMMIT=be71ee8c12cd7dc5ca8fa9581f708c2e8561fe2a
 RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends g++ glslang-tools; \
+    rm -rf /var/lib/apt/lists/*; \
+    git clone --filter=blob:none https://github.com/KhronosGroup/SPIRV-Cross.git /tmp/spirv-cross; \
+    git -C /tmp/spirv-cross checkout "$SPIRV_CROSS_COMMIT"; \
+    make -C /tmp/spirv-cross -j2; \
+    install -m 0755 /tmp/spirv-cross/spirv-cross /usr/local/bin/spirv-cross; \
+    rm -rf /tmp/spirv-cross; \
     printf 'y\n%.0s' $(seq 1 50) | sdkmanager --licenses >/dev/null; \
     sdkmanager --install "ndk;27.2.12479018" >/dev/null; \
     chmod -R a+rX "$ANDROID_HOME/ndk"

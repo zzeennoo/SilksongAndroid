@@ -9,11 +9,13 @@
 
 #if UNITY_ANDROID && !UNITY_EDITOR
 using UnityEngine;
+using UnityEngine.Rendering;
 
 public static class LowMemoryProfile
 {
     public const int MEMORY_LIMIT_MB = 3200;
-    public const int MAX_FRAME_RATE = 30;
+    public const int MAX_FRAME_RATE_VULKAN = 30;
+    public const int MAX_FRAME_RATE_GLES3 = 60;
     public const int MAX_RENDER_SHORT_SIDE = 540;
     public const int MIN_TEXTURE_MIP_LIMIT = 1;
 
@@ -32,6 +34,8 @@ public static class LowMemoryProfile
     }
 
     public static bool Enabled => MemoryMb > 0 && MemoryMb <= MEMORY_LIMIT_MB;
+    public static bool IsOpenGles => SystemInfo.graphicsDeviceType == GraphicsDeviceType.OpenGLES3;
+    public static int MaxFrameRate => IsOpenGles ? MAX_FRAME_RATE_GLES3 : MAX_FRAME_RATE_VULKAN;
 
     public static void Announce()
     {
@@ -39,7 +43,7 @@ public static class LowMemoryProfile
         _announced = true;
         Debug.Log(
             $"[LowMemoryProfile] enabled: memory={MemoryMb}MB, " +
-            $"shader warmup=off, frame cap={MAX_FRAME_RATE}, " +
+            $"graphics={SystemInfo.graphicsDeviceType}, shader warmup=off, frame cap={MaxFrameRate}, " +
             $"render short side<={MAX_RENDER_SHORT_SIDE}, " +
             $"texture mip limit>={MIN_TEXTURE_MIP_LIMIT}, AA=off");
     }

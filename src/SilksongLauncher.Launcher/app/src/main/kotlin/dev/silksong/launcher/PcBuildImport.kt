@@ -21,9 +21,12 @@ import java.util.zip.ZipFile
 object PcBuildImport {
 
     private const val FORMAT = "1"
-    private const val PC_BUILD_CONTRACT = "android-system-io-fallback-v4"
+    private const val PC_BUILD_CONTRACT = "android-graphics-backend-v1"
     private const val MANIFEST = "manifest.properties"
-    private const val MAX_BUNDLE_BYTES = 1_500L * 1024L * 1024L
+    private const val MAX_BUNDLE_BYTES = 3_000L * 1024L * 1024L
+    const val GRAPHICS_VULKAN = "vulkan"
+    const val GRAPHICS_GLES3 = "gles3"
+    private const val GLES_PATCHES = "gles-shaders.zip"
     private val DIGEST = Regex("[0-9a-f]{64}")
 
     private data class Payload(
@@ -31,18 +34,20 @@ object PcBuildImport {
         val maximum: Long,
     )
 
-    private val payloads = listOf(
+    private val basePayloads = listOf(
         Payload("libil2cpp.so", 700L * 1024L * 1024L),
         Payload("libunity.so", 100L * 1024L * 1024L),
         Payload("libmain.so", 10L * 1024L * 1024L),
         Payload("data.apk", 300L * 1024L * 1024L),
         Payload("classes.jar", 20L * 1024L * 1024L),
     )
+    private val glesPayload = Payload(GLES_PATCHES, 2_000L * 1024L * 1024L)
 
     data class Staged(
         val directory: File,
         val createdUtc: String,
         val runtimeDigest: String,
+        val graphicsApi: String,
     )
 
     /** The exact game inputs from which IL2CPP output was generated. */
@@ -81,8 +86,9 @@ object PcBuildImport {
      * Copies and verifies every payload into an isolated directory.
      *
      * No installed file is touched until the whole ZIP, its launcher identity,
-     * and its depot identity have passed. Only the five known entries are ever
-     * extracted, so path traversal and unrelated ZIP contents are inert.
+     * and its depot identity have passed. Only the known base entries and the
+     * backend's declared optional entry are ever extracted, so path traversal
+     * and unrelated ZIP contents are inert.
      */
     fun stage(
         context: Context,
@@ -129,18 +135,20 @@ object PcBuildImport {
                 val properties = Properties().apply {
                     ByteArrayInputStream(manifestBytes).use { load(BufferedInputStream(it)) }
                 }
-                validateManifest(context, properties, depot, launcherSignature)
+                val graphicsApi = validateManifest(context, properties, depot, launcherSignature)
+                val payloads = basePayloads + if (graphicsApi == GRAPHICS_GLES3) listOf(glesPayload) else emptyList()
 
                 for ((index, payload) in payloads.withIndex()) {
                     onProgress("Checking ${payload.name} (${index + 1} of ${payloads.size})")
                     val entry = zip.getJarEntry("payload/${payload.name}")
                         ?: throw IOException("The PC build is missing ${payload.name}")
-                    val declared = properties.getProperty("${payload.name}.size")?.toLongOrNull()
+                    val manifestName = payload.name.replace('-', '_')
+                    val declared = properties.getProperty("$manifestName.size")?.toLongOrNull()
                         ?: throw IOException("The PC build has no size for ${payload.name}")
                     if (declared !in 1..payload.maximum || entry.size != declared) {
                         throw IOException("${payload.name} has an invalid size")
                     }
-                    val expected = properties.getProperty("${payload.name}.sha256").orEmpty()
+                    val expected = properties.getProperty("$manifestName.sha256").orEmpty()
                     if (!DIGEST.matches(expected)) {
                         throw IOException("The PC build has no valid digest for ${payload.name}")
                     }
@@ -167,11 +175,12 @@ object PcBuildImport {
                     val actual = digest.digest().joinToString("") { "%02x".format(it) }
                     if (actual != expected) throw IOException("${payload.name} failed its SHA-256 check")
                 }
-                validatePayloads(staged)
+                validatePayloads(staged, graphicsApi)
                 return Staged(
                     staged,
                     properties.getProperty("createdUtc").orEmpty(),
                     properties.getProperty("libil2cpp.so.sha256").orEmpty(),
+                    graphicsApi,
                 )
             }
         } catch (t: Throwable) {
@@ -232,7 +241,7 @@ object PcBuildImport {
         properties: Properties,
         depot: File,
         launcherSignature: String,
-    ) {
+    ): String {
         if (properties.getProperty("format") != FORMAT) {
             throw IOException("This PC build uses an unsupported format")
         }
@@ -244,9 +253,13 @@ object PcBuildImport {
         }
         if (properties.getProperty("pcBuildContract") != PC_BUILD_CONTRACT) {
             throw IOException(
-                "This PC build predates the Android PathInternal compatibility patch. " +
+                "This PC build predates the selectable graphics backend. " +
                     "Run Build-On-Windows again and import the new ZIP.",
             )
+        }
+        val graphicsApi = properties.getProperty("graphicsApi").orEmpty()
+        if (graphicsApi != GRAPHICS_VULKAN && graphicsApi != GRAPHICS_GLES3) {
+            throw IOException("This PC build has an unsupported graphics backend")
         }
         if (properties.getProperty("launcherSignature") != launcherSignature) {
             throw IOException("The APK and PC build do not match. Install the APK produced beside this ZIP.")
@@ -255,9 +268,10 @@ object PcBuildImport {
         if (!DIGEST.matches(expectedDepot) || depotFingerprint(depot) != expectedDepot) {
             throw IOException("The PC build was made from a different Silksong depot")
         }
+        return graphicsApi
     }
 
-    private fun validatePayloads(staged: File) {
+    private fun validatePayloads(staged: File, graphicsApi: String) {
         for (name in listOf("libil2cpp.so", "libunity.so", "libmain.so")) {
             val file = File(staged, name)
             val magic = file.inputStream().use { input ->
@@ -285,6 +299,13 @@ object PcBuildImport {
         ZipFile(File(staged, "classes.jar")).use { zip ->
             if (zip.getEntry("classes.dex") == null) throw IOException("classes.jar has no classes.dex")
         }
+        if (graphicsApi == GRAPHICS_GLES3) {
+            ZipFile(File(staged, GLES_PATCHES)).use { zip ->
+                if (zip.getEntry("manifest.json") == null) {
+                    throw IOException("$GLES_PATCHES has no shader patch manifest")
+                }
+            }
+        }
     }
 
     /** Installs an already-verified set. Readiness is written separately, last. */
@@ -299,6 +320,12 @@ object PcBuildImport {
             File(staged.directory, "classes.jar"),
             File(UnityDex.outputDir(context), "classes.jar"),
         )
+        val installedGlesPatches = glesPatch(pkgDir)
+        if (staged.graphicsApi == GRAPHICS_GLES3) {
+            copyAtomic(File(staged.directory, GLES_PATCHES), installedGlesPatches)
+        } else {
+            installedGlesPatches.delete()
+        }
         // The digest validated while reading the signed ZIP is not enough for
         // the identity log: prove the file in the executable private runtime
         // directory is still that exact payload after the atomic copy.
@@ -313,14 +340,17 @@ object PcBuildImport {
         }
         BuildInstallation.writeAtomic(
             File(pkgDir, ".pc-build.identity"),
-            "createdUtc=${staged.createdUtc}\nlibil2cppSha256=$installedDigest\n",
+            "createdUtc=${staged.createdUtc}\nlibil2cppSha256=$installedDigest\n" +
+                "graphicsApi=${staged.graphicsApi}\n",
         )
         staged.directory.deleteRecursively()
         LauncherLog.log(
             "PC build installed: created=${staged.createdUtc.ifEmpty { "unknown" }}, " +
-                "libil2cpp=$installedDigest",
+                "graphics=${staged.graphicsApi}, libil2cpp=$installedDigest",
         )
     }
+
+    fun glesPatch(pkgDir: File): File = File(pkgDir, GLES_PATCHES)
 
     private fun copyAtomic(from: File, to: File, executable: Boolean = false) {
         to.parentFile?.mkdirs()

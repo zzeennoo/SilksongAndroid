@@ -76,7 +76,9 @@ copy that must agree.
 
 **A built player has no `m_BuildTargetGraphicsAPIs`.** The resolved list lives in
 `BuildSettings.m_GraphicsAPIs`, and a Linux build leaves `[17 OpenGLCore, 21 Vulkan]`
-behind. Android needs `[21]` alone.
+behind. The default Android route uses `[21]`. The optional PC-built GLES route
+uses `[11]`, but only after translating the Vulkan program slice to a real
+GLES3 slice; changing this number alone leaves the player with unusable shaders.
 
 **`unity default resources` is an engine built-in, not game data.** Use the
 Android player's copy (3.57 MB), not the depot's Linux one (5.59 MB), or the
@@ -122,6 +124,13 @@ shader to its Vulkan slice:
 ```bash
 BundleSurgery retarget-tree <depot>/StreamingAssets/aa/StandaloneLinux64 out/aa/StandaloneLinux64
 ```
+
+For the optional GLES PC build, `build-gles3-patches` translates every
+referenced SPIR-V program to validated ESSL 3.10 and emits content-addressed
+shader blobs. `retarget-tree-gles` applies that signed patch set in place on
+the device. This split is deliberate: the large content stays in the user's
+depot, while no compiler or cross-converter has to run under the handheld's
+3 GB memory limit.
 
 Note this walks the tree **recursively**. A shipped Addressables tree groups
 content into subdirectories, and in this game 911 of the 2068 bundles — 590 of

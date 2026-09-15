@@ -23,13 +23,15 @@ from pathlib import Path
 
 UNITY_VERSION = "6000.0.50f1"
 PACKAGE = "com.jakobkhansen.silksong"
-PC_BUILD_CONTRACT = "android-system-io-fallback-v4"
+PC_BUILD_CONTRACT = "android-graphics-backend-v1"
 # The staged unityaot assemblies are now patched before conversion, so their
 # digest already invalidates an older C++ tree. Keep a named contract as well:
 # it makes the reason explicit and prevents a coincidental input hash match
 # from ever crossing this compatibility boundary.
 CONVERSION_CACHE_CONTRACT = "android-system-io-fallback-v1"
 CONTENT_ROOT = f"/data/user/0/{PACKAGE}/files/aa"
+GRAPHICS_APIS = {"vulkan": "21", "gles3": "11"}
+GLES_PATCH_CONTRACT = "spirv-cross-be71ee8-essl310-v1"
 ROSLYN_VERSION = "4.12.0"
 ROSLYN_BYTES = 21_775_071
 ROSLYN_FILES = (
@@ -585,7 +587,15 @@ def register_patches(image: Path, asm: Path, entrypoints: Path) -> None:
     loads_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
 
 
-def build_player_image(repo: Path, unity: Path, depot_data: Path, root: Path, converted: Path, asm: Path) -> Path:
+def build_player_image(
+    repo: Path,
+    unity: Path,
+    depot_data: Path,
+    root: Path,
+    converted: Path,
+    asm: Path,
+    graphics_api: str = "vulkan",
+) -> Path:
     surgery = repo / "tools/bundle-surgery/bin/Release/net8.0/BundleSurgery.dll"
     image = root / "image"
     catalog_out = root / "aa"
@@ -595,10 +605,11 @@ def build_player_image(repo: Path, unity: Path, depot_data: Path, root: Path, co
     (image / "Managed/Metadata").mkdir(parents=True)
     (image / "Managed/Resources").mkdir(parents=True)
 
+    shader_command = "extract-gles3-android" if graphics_api == "gles3" else "extract-vulkan-android"
     for name in ("globalgamemanagers.assets", "resources.assets", "sharedassets0.assets"):
         source = depot_data / name
         if source.is_file():
-            run(["dotnet", str(surgery), "extract-vulkan-android", str(source), str(image / name)])
+            run(["dotnet", str(surgery), shader_command, str(source), str(image / name)])
     for name in (
         "globalgamemanagers", "level0", "boot.config", "RuntimeInitializeOnLoads.json",
         "ScriptingAssemblies.json", "app.info", "globalgamemanagers.assets.resS", "resources.assets.resS",
@@ -635,7 +646,7 @@ def build_player_image(repo: Path, unity: Path, depot_data: Path, root: Path, co
         retarget_serialized(path)
 
     ggm = image / "globalgamemanagers"
-    run(["dotnet", str(surgery), "set-graphics-apis", str(ggm), "21"])
+    run(["dotnet", str(surgery), "set-graphics-apis", str(ggm), GRAPHICS_APIS[graphics_api]])
     run(["dotnet", str(surgery), "set-build-version", str(ggm), UNITY_VERSION])
     boot = image / "boot.config"
     if boot.is_file():
@@ -689,16 +700,56 @@ def dex_player(unity: Path, root: Path) -> Path:
     return output
 
 
+def gles_patch_fingerprint(aa: Path) -> str:
+    """Fast cache identity for the large Addressables shader walk."""
+    digest = hashlib.sha256()
+    digest.update(GLES_PATCH_CONTRACT.encode("ascii"))
+    digest.update(b"\0")
+    for path in sorted(aa.rglob("*.bundle"), key=lambda p: p.relative_to(aa).as_posix()):
+        stat = path.stat()
+        digest.update(path.relative_to(aa).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(stat.st_size).encode("ascii"))
+        digest.update(b"/")
+        digest.update(str(stat.st_mtime_ns).encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def build_gles_shader_patches(repo: Path, depot_data: Path, root: Path) -> Path:
+    surgery = repo / "tools/bundle-surgery/bin/Release/net8.0/BundleSurgery.dll"
+    aa = depot_data / "StreamingAssets/aa"
+    if not aa.is_dir():
+        fail(f"the depot has no Addressables tree at {aa}")
+    output = root / "gles-shaders.zip"
+    receipt = root / "gles-shaders.stamp"
+    expected = gles_patch_fingerprint(aa)
+    if output.is_file() and receipt.is_file() and receipt.read_text(encoding="ascii").strip() == expected:
+        note("reusing verified OpenGL ES Addressables shader patches")
+        run(["dotnet", str(surgery), "audit-gles3-patches", str(output)])
+        return output
+
+    env = os.environ.copy()
+    env["SILKSONG_GLES_SHADER_CACHE"] = str(root / "gles-program-cache")
+    note("translating all Addressables shaders to OpenGL ES 3.1")
+    run(["dotnet", str(surgery), "build-gles3-patches", str(aa), str(output)], env=env)
+    run(["dotnet", str(surgery), "audit-gles3-patches", str(output)])
+    receipt.write_text(expected + "\n", encoding="ascii")
+    return output
+
+
 def write_bundle(
     output_dir: Path,
     version: str,
     signature: str,
     depot_digest: str,
     payloads: dict[str, Path],
+    graphics_api: str = "vulkan",
 ) -> Path:
     manifest = {
         "format": "1", "package": PACKAGE, "unityVersion": UNITY_VERSION,
         "pcBuildContract": PC_BUILD_CONTRACT,
+        "graphicsApi": graphics_api,
         "launcherSignature": signature, "depotFingerprint": depot_digest,
         "versionName": version, "createdUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -709,7 +760,8 @@ def write_bundle(
     manifest_text = "".join(f"{key}={value}\n" for key, value in manifest.items())
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    final = output_dir / f"SilksongAndroid-{version}-PC-Build.zip"
+    flavor = "-OpenGLES3" if graphics_api == "gles3" else ""
+    final = output_dir / f"SilksongAndroid-{version}{flavor}-PC-Build.zip"
     part = output_dir / (final.name + ".part")
     part.unlink(missing_ok=True)
     note("packing the import bundle")
@@ -775,6 +827,7 @@ def main() -> int:
     parser.add_argument("--storepass", required=True)
     parser.add_argument("--keypass", required=True)
     parser.add_argument("--key-alias", required=True)
+    parser.add_argument("--graphics-api", choices=tuple(GRAPHICS_APIS), default="vulkan")
     args = parser.parse_args()
     if args.jobs < 1 or args.jobs > 64:
         fail("--jobs must be between 1 and 64")
@@ -796,7 +849,7 @@ def main() -> int:
     asm = stage_assemblies(unity, data, packages, root)
     _, converted = convert(repo, unity, root, asm, args.jobs)
     libil2cpp = compile_native(repo, unity, root, args.jobs)
-    data_apk = build_player_image(repo, unity, data, root, converted, asm)
+    data_apk = build_player_image(repo, unity, data, root, converted, asm, args.graphics_api)
     classes = dex_player(unity, root)
     libunity = find_android_file(unity / "android", "Variations/il2cpp/Release/Libs/arm64-v8a/libunity.so")
     libmain = find_android_file(unity / "android", "Variations/il2cpp/Release/Libs/arm64-v8a/libmain.so")
@@ -809,8 +862,11 @@ def main() -> int:
         "data.apk": data_apk,
         "classes.jar": classes,
     }
+    if args.graphics_api == "gles3":
+        payloads["gles-shaders.zip"] = build_gles_shader_patches(repo, data, root)
     bundle = write_bundle(
         args.output.resolve(), version, signature, depot_fingerprint(data), payloads,
+        args.graphics_api,
     )
     sign_bundle(bundle, args.keystore.resolve(), args.storepass, args.keypass, args.key_alias)
     verify_bundle_payloads(bundle, payloads)

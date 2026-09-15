@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -13,6 +14,7 @@ from pathlib import Path
 
 MODULE_PATH = Path(__file__).parents[1] / "build.py"
 VERIFY_SYSTEM_IO = Path(__file__).parents[1] / "verify-system-io.py"
+REPO_ROOT = Path(__file__).parents[3]
 SPEC = importlib.util.spec_from_file_location("pc_builder", MODULE_PATH)
 pc_builder = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -53,6 +55,26 @@ class PcBuilderTests(unittest.TestCase):
             before = pc_builder.depot_fingerprint(data)
             (data / "Managed/A.dll").write_bytes(b"b")
             self.assertNotEqual(before, pc_builder.depot_fingerprint(data))
+
+    def test_gles_patch_fingerprint_covers_bundle_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            aa = Path(tmp)
+            (aa / "StandaloneLinux64").mkdir()
+            bundle = aa / "StandaloneLinux64/scene.bundle"
+            bundle.write_bytes(b"first")
+            before = pc_builder.gles_patch_fingerprint(aa)
+            bundle.write_bytes(b"second version")
+            self.assertNotEqual(before, pc_builder.gles_patch_fingerprint(aa))
+
+    def test_gles_converter_contract_matches_pinned_source(self):
+        dockerfile = (REPO_ROOT / "tools/docker/apk.Dockerfile").read_text()
+        shader_tool = (REPO_ROOT / "tools/bundle-surgery/ShaderGles.cs").read_text()
+        commit = re.search(r"SPIRV_CROSS_COMMIT=([0-9a-f]{40})", dockerfile)
+        contract = re.search(r'ConverterContract = "([^"]+)"', shader_tool)
+        self.assertIsNotNone(commit)
+        self.assertIsNotNone(contract)
+        self.assertEqual(pc_builder.GLES_PATCH_CONTRACT, contract.group(1))
+        self.assertIn(commit.group(1)[:7], pc_builder.GLES_PATCH_CONTRACT)
 
     def test_staging_excludes_non_unityaot_core_libraries(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -589,10 +611,33 @@ class PcBuilderTests(unittest.TestCase):
                 )
                 manifest = archive.read("manifest.properties").decode("ascii")
                 self.assertIn(f"pcBuildContract={pc_builder.PC_BUILD_CONTRACT}\n", manifest)
+                self.assertIn("graphicsApi=vulkan\n", manifest)
                 for name, path in payloads.items():
                     self.assertIn(f"{name}.size={path.stat().st_size}\n", manifest)
                     self.assertIn(f"{name}.sha256={pc_builder.sha256(path)}\n", manifest)
             pc_builder.verify_bundle_payloads(bundle, payloads)
+
+    def test_gles_bundle_names_backend_and_includes_shader_patches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payloads = {}
+            for name in (
+                "libil2cpp.so", "libunity.so", "libmain.so", "data.apk",
+                "classes.jar", "gles-shaders.zip",
+            ):
+                path = root / name
+                path.write_bytes((name + "\n").encode())
+                payloads[name] = path
+            bundle = pc_builder.write_bundle(
+                root / "out", "1.2.3", "2|signature", "a" * 64,
+                payloads, "gles3",
+            )
+            self.assertIn("OpenGLES3", bundle.name)
+            with zipfile.ZipFile(bundle) as archive:
+                manifest = archive.read("manifest.properties").decode("ascii")
+                self.assertIn("graphicsApi=gles3\n", manifest)
+                self.assertIn("gles_shaders.zip.sha256=", manifest)
+                self.assertIn("payload/gles-shaders.zip", archive.namelist())
 
     def test_bundle_verification_rejects_a_payload_different_from_the_built_library(self):
         with tempfile.TemporaryDirectory() as tmp:

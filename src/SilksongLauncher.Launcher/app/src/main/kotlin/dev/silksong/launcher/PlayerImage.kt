@@ -212,7 +212,7 @@ object PlayerImage {
      * is skipped moves nothing at all, so a tree that was current stays
      * current for as long as nothing else writes to it.
      */
-    private fun contentStamp(aa: File): String {
+    private fun contentStamp(aa: File, graphicsApi: String, glesPatch: File?): String {
         var count = 0L
         var bytes = 0L
         var newest = 0L
@@ -223,7 +223,8 @@ object PlayerImage {
             val m = f.lastModified()
             if (m > newest) newest = m
         }
-        return "$count/$bytes/$newest"
+        val patchIdentity = glesPatch?.takeIf { it.isFile }?.let { "${it.length()}/${it.lastModified()}" } ?: "none"
+        return "$graphicsApi/$patchIdentity/$count/$bytes/$newest"
     }
 
     /**
@@ -480,6 +481,8 @@ object PlayerImage {
         context: android.content.Context,
         root: File,
         assets: android.content.res.AssetManager,
+        graphicsApi: String = PcBuildImport.GRAPHICS_VULKAN,
+        glesPatch: File? = null,
     ): Flow<Progress> = channelFlow {
         val data = depotData(depot) ?: throw IOException("no player data under $depot")
         val aa = File(data, "StreamingAssets/aa")
@@ -499,7 +502,24 @@ object PlayerImage {
 
         // Nothing a patch edit does can reach the content tree, and this step
         // is minutes of opening bundles to conclude exactly that.
-        if (contentStampFile(root).takeIf { it.isFile }?.readText() == contentStamp(aa)) {
+        if (graphicsApi != PcBuildImport.GRAPHICS_VULKAN &&
+            graphicsApi != PcBuildImport.GRAPHICS_GLES3
+        ) throw IOException("unsupported graphics backend $graphicsApi")
+        if (graphicsApi == PcBuildImport.GRAPHICS_GLES3 && glesPatch?.isFile != true) {
+            throw IOException("the imported OpenGL ES shader patch archive is missing")
+        }
+
+        val previousStamp = contentStampFile(root).takeIf { it.isFile }?.readText().orEmpty()
+        if (graphicsApi == PcBuildImport.GRAPHICS_VULKAN &&
+            previousStamp.startsWith("${PcBuildImport.GRAPHICS_GLES3}/")
+        ) {
+            throw IOException(
+                "this content tree is already OpenGL ES-only; restore its original Linux " +
+                    "Addressables content before switching back to Vulkan",
+            )
+        }
+
+        if (previousStamp == contentStamp(aa, graphicsApi, glesPatch)) {
             LauncherLog.log("content is already retargeted; skipping")
             send(Progress("Content ready", 1f, "already retargeted"))
             return@channelFlow
@@ -567,13 +587,21 @@ object PlayerImage {
                 }
             }
             val r = try {
-                run(
-                    surgery,
-                    context,
+                val command = if (graphicsApi == PcBuildImport.GRAPHICS_GLES3) {
+                    listOf(
+                        "retarget-tree-gles", aa.absolutePath, group.absolutePath,
+                        receipt.absolutePath, glesPatch!!.absolutePath,
+                    )
+                } else {
                     listOf(
                         "retarget-tree", group.absolutePath, group.absolutePath,
                         receipt.absolutePath,
-                    ),
+                    )
+                }
+                run(
+                    surgery,
+                    context,
+                    command,
                 ) { line ->
                     PROGRESS.find(line)?.let { match ->
                         val n = match.groupValues[1].toIntOrNull() ?: return@let
@@ -606,7 +634,7 @@ object PlayerImage {
         // Recomputed rather than reused: the run just rewrote these files, so
         // the stamp that identifies "already retargeted" is the state they are
         // in now, not the state they were in when the run started.
-        contentStampFile(root).writeText(contentStamp(aa))
+        contentStampFile(root).writeText(contentStamp(aa, graphicsApi, glesPatch))
         send(Progress("Content ready", 1f, "$total bundles"))
     }.flowOn(Dispatchers.IO)
 

@@ -10,6 +10,10 @@ param(
     [int]$Jobs = 0,
 
     [Parameter(Mandatory = $false)]
+    [ValidateSet("Vulkan", "OpenGLES3")]
+    [string]$GraphicsApi = "Vulkan",
+
+    [Parameter(Mandatory = $false)]
     [switch]$ValidatePathsOnly
 )
 
@@ -57,6 +61,7 @@ $OutputPath = [System.IO.Path]::GetFullPath($Output)
 Write-Host "Silksong Android PC builder" -ForegroundColor Cyan
 Write-Host "  Linux depot: $DepotPath"
 Write-Host "  Output:      $OutputPath"
+Write-Host "  Graphics:    $GraphicsApi"
 if ($Jobs -gt 0) { Write-Host "  Jobs:        $Jobs" }
 else { Write-Host "  Jobs:        automatic (memory-safe)" }
 Write-Host ""
@@ -83,6 +88,9 @@ $DockerArgs = @(
     "--volume", "silksong-signing:/root/.android",
     "--env", "GRADLE_DAEMON=0"
 )
+if ($GraphicsApi -eq "OpenGLES3") {
+    $DockerArgs += @("--env", "PC_GRAPHICS_API=gles3")
+}
 if ($Jobs -gt 0) {
     $DockerArgs += @("--env", "PC_BUILD_JOBS=$Jobs")
 }

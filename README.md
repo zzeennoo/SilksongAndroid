@@ -58,6 +58,27 @@ downloads and caches the pinned build tools. It produces a matching APK and a
 and choose **Import PC build** without extracting it. Keep the Linux depot on
 the device—the ZIP deliberately excludes its 8 GB of game content.
 
+An experimental OpenGL ES 3.1 build is available for devices whose Vulkan
+driver exhausts shared graphics memory. It keeps Vulkan as the default for
+other devices and targets 60 fps at a 540-pixel render short side on the 3 GB
+profile (720×540 on the AYANEO's 4:3 screen):
+
+```powershell
+.\Build-On-Windows.ps1 -Depot "D:\Games\Silksong-Linux" -GraphicsApi OpenGLES3
+```
+
+The content rewrite keeps only the selected shader backend. You can move from
+an already-retargeted Vulkan tree to OpenGL ES because the PC bundle supplies
+the converted GLES blobs. Moving that same tree back to Vulkan requires
+restoring the original Linux Addressables content; the launcher rejects the
+unsafe direction instead of producing a mixed package.
+
+This route translates and validates every referenced shader on the PC and
+puts a deduplicated patch set in the signed import ZIP; the handheld only
+applies those blobs. It does not run a shader compiler on-device. The 60 fps
+value is a target/cap, not a guarantee—the GLES driver and game workload still
+decide the achieved rate.
+
 The first PC-built APK may not install over an APK from another source because
 Android requires matching signing keys. If Android says **App not installed**,
 see the signing/data-preservation note in the [PC builder guide](tools/pc-builder/README.md)
