@@ -200,7 +200,7 @@ class PcBuilderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "mscorlib.cpp").write_text(
-                "bool PathInternal_GetIsCaseSensitive_mAAAA() { return ((bool)0); }",
+                "bool PathInternal_GetIsCaseSensitive_mAAAA() { { return (bool)0; } }",
                 encoding="utf-8",
             )
             analysis = system_io_verifier.analyze_sources(
@@ -209,6 +209,22 @@ class PcBuilderTests(unittest.TestCase):
             self.assertEqual(
                 {"PathInternal_GetIsCaseSensitive_mAAAA"}, analysis["patched_paths"],
             )
+
+    def test_system_io_guard_rejects_nested_fallback_with_sibling_statement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "mscorlib.cpp").write_text(
+                """
+                bool PathInternal_GetIsCaseSensitive_mAAAA() {
+                    { trace_probe(); return (bool)0; }
+                }
+                """,
+                encoding="utf-8",
+            )
+            with self.assertRaises(SystemExit):
+                system_io_verifier.analyze_sources(
+                    root, require_case_insensitive_fallback=True,
+                )
 
     def test_system_io_guard_requires_every_pathinternal_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -91,10 +91,18 @@ def definitions(text: str, pattern: re.Pattern[str]) -> list[tuple[str, str, int
 
 def is_constant_false_body(body: str) -> bool:
     """True only for the exact C++ shape emitted by ``ldc.i4.0; ret``."""
-    without_comments = re.sub(r"//[^\n]*(?:\n|$)|/\*.*?\*/", "", body, flags=re.S)
-    statement = re.fullmatch(
-        r"\{\s*return\s+(.+?)\s*;\s*\}", without_comments.strip(), re.S,
-    )
+    scoped = re.sub(r"//[^\n]*(?:\n|$)|/\*.*?\*/", "", body, flags=re.S).strip()
+    # Unity 6000 emits a redundant lexical scope for this Cecil-authored
+    # two-instruction body: ``{ { return (bool)0; } }``. Unwrap only compound
+    # statements that cover the entire remaining body. Any sibling statement,
+    # declaration, branch, or call therefore still makes the audit fail closed.
+    scope_count = 0
+    while scoped.startswith("{") and _balanced_end(scoped, 0, "{", "}") == len(scoped):
+        scoped = scoped[1:-1].strip()
+        scope_count += 1
+    if scope_count == 0:
+        return False
+    statement = re.fullmatch(r"return\s+(.+?)\s*;", scoped, re.S)
     if statement is None:
         return False
     expression = re.sub(r"\s+", "", statement.group(1))
