@@ -174,9 +174,16 @@ def analyze_sources(root: Path, require_case_insensitive_fallback: bool = False)
         if not graph[symbol] and symbol not in patched_paths
     ]
     if roots_without_ctor:
+        detail = []
+        for symbol in sorted(roots_without_ctor):
+            for source, body, offset in path_definitions[symbol]:
+                line = source_texts[source].count("\n", 0, offset) + 1
+                compact = " ".join(body.split())[:500]
+                detail.append(f"{symbol} [{source.relative_to(root)}:{line}] = {compact}")
         raise SystemExit(
             "IL2CPP System.IO audit: PathInternal definition(s) call no recognizable "
-            "FileStream constructor: " + ", ".join(sorted(roots_without_ctor))
+            "FileStream constructor and are not the constant fallback:\n  " +
+            "\n  ".join(detail)
         )
     if require_case_insensitive_fallback:
         unpatched = set(path_definitions) - patched_paths
