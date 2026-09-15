@@ -926,7 +926,10 @@ class SetupActivity : Activity() {
                 // is involved in an imported build.
                 MonoRuntime.stage(this@SetupActivity)
                     .collect { setBusy(true, it.step, it.fraction, it.detail) }
-                PlayerImage.retargetContent(depot, this@SetupActivity, out, assets)
+                PlayerImage.retargetContent(
+                    depot, this@SetupActivity, out, assets,
+                    staged.graphicsApi, PcBuildImport.glesPatch(pkgDir),
+                )
                     .collect { setBusy(true, it.step, it.fraction, it.detail) }
 
                 withContext(Dispatchers.IO) {

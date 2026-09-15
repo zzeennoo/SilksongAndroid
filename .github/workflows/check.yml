@@ -81,6 +81,16 @@ jobs:
             silksong-pc-builder:check \
             -m unittest discover -s tools/pc-builder/tests -v
 
+      - name: Verify OpenGL ES shader conversion tools
+        run: |
+          docker run --rm --platform linux/amd64 \
+            --entrypoint /bin/bash \
+            --workdir /workspace \
+            -v "$PWD:/workspace" \
+            silksong-pc-builder:check -lc \
+            'dotnet build -c Release tools/bundle-surgery/BundleSurgery.csproj --nologo -v quiet && \
+             dotnet tools/bundle-surgery/bin/Release/net8.0/BundleSurgery.dll self-test-gles3'
+
       - name: Cache build inputs
         uses: actions/cache@v4
         with:

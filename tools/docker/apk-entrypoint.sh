@@ -218,6 +218,7 @@ case "$MODE" in
             --key-alias "${KEY_ALIAS:-androiddebugkey}"
         )
         [[ -z "${PC_BUILD_JOBS:-}" ]] || pc_args+=(--jobs "$PC_BUILD_JOBS")
+        pc_args+=(--graphics-api "${PC_GRAPHICS_API:-vulkan}")
         python3 tools/pc-builder/build.py "${pc_args[@]}"
         ;;
     shell)

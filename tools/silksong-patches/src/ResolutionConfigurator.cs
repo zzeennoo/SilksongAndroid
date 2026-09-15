@@ -147,10 +147,13 @@ public static class ResolutionConfigurator
      * because it costs nothing and makes the menu agree when it is read fresh.
      *
      * A deliberate 30 or 60 is still respected -- that is a real choice about
-     * battery. Only the sentinel is corrected.
+     * battery. The one migration exception is the port's own old automatic
+     * Vulkan cap of 30: the GLES profile promotes that to its automatic 60
+     * once, then records which value is automatic so a later manual 30 stays.
      */
     const string PREF_FRAME_CAP = "VidTFR";
     const string PREF_VSYNC = "VidVSync";
+    const string PREF_AUTOMATIC_FRAME_CAP = "SilksongAndroidAutoFrameCap";
 
     /**
      * The largest cap the game will accept, worked out the way it works it out.
@@ -183,19 +186,33 @@ public static class ResolutionConfigurator
         {
             int largest = LargestAcceptedCap();
             int cap = LowMemoryProfile.Enabled
-                ? Mathf.Min(largest, LowMemoryProfile.MAX_FRAME_RATE)
+                ? Mathf.Min(largest, LowMemoryProfile.MaxFrameRate)
                 : largest;
 
             int stored = PlayerPrefs.GetInt(PREF_FRAME_CAP, -1);
-            if (stored <= 0 || (LowMemoryProfile.Enabled && stored > cap))
+            int automatic = PlayerPrefs.GetInt(PREF_AUTOMATIC_FRAME_CAP, 0);
+            bool promoteOldVulkanDefault =
+                LowMemoryProfile.Enabled && LowMemoryProfile.IsOpenGles &&
+                stored == LowMemoryProfile.MAX_FRAME_RATE_VULKAN &&
+                (automatic == 0 || automatic == stored);
+            bool replaceStored = stored <= 0 ||
+                (LowMemoryProfile.Enabled && stored > cap) ||
+                promoteOldVulkanDefault;
+            if (replaceStored)
             {
                 // Still written, so the options menu shows something true when
                 // it reads the pref fresh. Not relied on: see the note above.
                 PlayerPrefs.SetInt(PREF_FRAME_CAP, cap);
+                if (LowMemoryProfile.Enabled)
+                    PlayerPrefs.SetInt(PREF_AUTOMATIC_FRAME_CAP, cap);
                 Debug.Log($"[ResolutionConfigurator] frame cap {stored} -> {cap} (held at {cap})");
             }
             else
             {
+                // The stored value no longer equals the value this port last
+                // selected, so it is a user's choice from now on.
+                if (automatic != 0 && automatic != stored)
+                    PlayerPrefs.SetInt(PREF_AUTOMATIC_FRAME_CAP, 0);
                 Debug.Log($"[ResolutionConfigurator] frame cap {stored} (kept; largest is {cap})");
             }
 
@@ -207,7 +224,7 @@ public static class ResolutionConfigurator
             PlayerPrefs.Save();
 
             QualitySettings.vSyncCount = 0;
-            int selected = stored > 0 ? stored : cap;
+            int selected = replaceStored ? cap : (stored > 0 ? stored : cap);
             if (LowMemoryProfile.Enabled && selected > cap) selected = cap;
             Application.targetFrameRate = selected;
 

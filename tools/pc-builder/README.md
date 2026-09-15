@@ -30,6 +30,31 @@ The launcher validates both the APK build and the device's depot before it
 installs anything. The ZIP is signed with the APK's own certificate as well,
 so an altered or third-party bundle is rejected before any library is installed.
 
+### Experimental OpenGL ES 3.1 path
+
+Vulkan remains the default. For the 3 GB AYANEO, where the Vulkan/ION path can
+drain CMA and be killed even while per-process PSS looks modest, build the
+alternate backend explicitly:
+
+```powershell
+.\Build-On-Windows.ps1 -Depot "D:\Games\Silksong-Linux" -GraphicsApi OpenGLES3
+```
+
+The output name contains `OpenGLES3`. The Linux depot does not contain an
+Android GLES shader slice, so changing `m_GraphicsAPIs` alone is invalid. This
+build translates every referenced Vulkan SPIR-V program to ESSL 3.10 with a
+pinned SPIRV-Cross, validates the result with glslang, and packages the top-
+level player shaders plus a deduplicated patch archive for all Addressables
+bundles. The archive is signed and hashed like every other PC-build payload.
+On import, the AYANEO only installs the converted blobs while retargeting the
+bundles; SPIRV-Cross and glslang never run on the device.
+
+On the low-memory profile GLES uses a 60 fps cap and a 540-pixel render short
+side. That is 720×540 on the AYANEO's 4:3 window, preserving its shape. Vulkan
+keeps the safer 30 fps cap. This is an experimental compatibility path, not a
+claim that GLES is normally faster than Vulkan or that every scene will hold
+60 fps.
+
 The locally generated APK has one signing identity that is kept in Docker's
 `silksong-signing` volume. It can update later APKs made by this same PC, but
 it cannot update an APK signed by GitHub or another machine. Android reports
@@ -86,3 +111,5 @@ docker run --rm --platform linux/amd64 \
   -v silksong-signing:/root/.android \
   -e PC_BUILD_JOBS=8 silksong-pc-builder:latest pc
 ```
+
+Add `-e PC_GRAPHICS_API=gles3` for the OpenGL ES build.

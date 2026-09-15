@@ -5,10 +5,10 @@ using System.Text;
 namespace BundleSurgery;
 
 // bundle-surgery: surgical rewrites of Unity asset bundles for the Silksong
-// Android port. The pipeline's main consumer is `extract-vulkan-android`,
-// which slices each shader down to its Vulkan blob and retargets the
-// bundle's BuildTarget header from Linux to Android. All other commands
-// are dev/inspection tools.
+// Android port. The default pipeline uses `extract-vulkan-android`. The PC
+// builder also has an explicit GLES path: it translates Vulkan SPIR-V on the
+// PC, packages a deduplicated shader patch set, and applies only those already
+// verified blobs on the device.
 //
 // usage:
 //   dotnet run -- <command> [args]
@@ -51,6 +51,10 @@ internal static class Program
             Console.Error.WriteLine("usage: BundleSurgery <command> [args]");
             Console.Error.WriteLine("commands:");
             Console.Error.WriteLine("  extract-vulkan-android <in.bundle> <out.bundle>  — extract Vulkan SPIR-V slice + retarget to Android (the main pipeline command)");
+            Console.Error.WriteLine("  extract-gles3-android <in.bundle> <out.bundle>    — translate Vulkan programs to ESSL 3.10 + retarget to Android (PC only)");
+            Console.Error.WriteLine("  build-gles3-patches <aa-root> <out.zip>           — preconvert every Addressables shader for device-side application (PC only)");
+            Console.Error.WriteLine("  audit-gles3-patches <patches.zip>                  — verify the GLES patch index, hashes and segment ranges");
+            Console.Error.WriteLine("  self-test-gles3                                    — exercise SPIR-V→ESSL and Unity shader-blob round trips");
             Console.Error.WriteLine("  set-unity-version <file> <version>               — rewrite the Unity version stamped in a SerializedFile (e.g. strip an internal branch suffix)");
             Console.Error.WriteLine("  set-graphics-apis <globalgamemanagers> <ids>     — set BuildSettings.m_GraphicsAPIs (21=Vulkan, 11=GLES3, 17=OpenGLCore)");
             Console.Error.WriteLine("  set-build-version <globalgamemanagers> <version> — set BuildSettings.m_Version (must match the SerializedFile version)");
@@ -59,6 +63,7 @@ internal static class Program
             Console.Error.WriteLine("  patch-system-io-case-sensitivity <assembly-dir> — replace every PathInternal case probe with its safe Android fallback");
             Console.Error.WriteLine("  audit-system-io <assembly-dir>                  — report launch-critical System.IO type owners");
             Console.Error.WriteLine("  retarget-tree <src-dir> <dst-dir> [progress]    — extract-vulkan-android over a whole bundle tree, in parallel, resumable");
+            Console.Error.WriteLine("  retarget-tree-gles <aa-root> <group> <progress> <patches.zip> — apply preconverted GLES blobs in place");
             Console.Error.WriteLine();
             Console.Error.WriteLine("inspection (diagnostic):");
             return 2;
@@ -75,7 +80,15 @@ internal static class Program
             "audit-system-io" when args.Length >= 2 => SystemIoAudit.Run(args[1]),
             "retarget-tree" when args.Length >= 3 => RetargetTree(
                 args[1], args[2], args.Length >= 4 ? args[3] : null),
+            "retarget-tree-gles" when args.Length >= 5 => ShaderGles.RetargetTree(
+                args[1], args[2], args[3], args[4], ClassDataPath),
             "extract-vulkan-android" when args.Length >= 3 => ExtractVulkanAndroid(args[1], args[2]),
+            "extract-gles3-android" when args.Length >= 3 => ShaderGles.ExtractAndroid(
+                args[1], args[2], ClassDataPath),
+            "build-gles3-patches" when args.Length >= 3 => ShaderGles.BuildPatchArchive(
+                args[1], args[2], ClassDataPath),
+            "audit-gles3-patches" when args.Length >= 2 => ShaderGles.AuditPatchArchive(args[1]),
+            "self-test-gles3" => ShaderGles.SelfTest(),
             "shader-report" when args.Length >= 2 => ShaderReport(args[1]),
             _ => Usage(),
         };
@@ -222,7 +235,7 @@ internal static class Program
             {
                 var bf = manager.GetBaseField(afile, asset);
                 if (bf == null) continue;
-                if (StripToVulkanOnly(bf))
+                if (StripToVulkanOnlyOrRejectGles(bf, $"{Path.GetFileName(inputPath)}:{asset.PathId}"))
                 {
                     asset.SetNewData(bf);
                     anyChange = true;
@@ -538,7 +551,7 @@ internal static class Program
             {
                 var bf = manager.GetBaseField(afile, asset);
                 if (bf == null) continue;
-                if (StripToVulkanOnly(bf))
+                if (StripToVulkanOnlyOrRejectGles(bf, $"{Path.GetFileName(inputPath)}:{asset.PathId}"))
                 {
                     asset.SetNewData(bf);
                     shadersProcessed++;
@@ -567,7 +580,7 @@ internal static class Program
             {
                 var bf = manager.GetBaseField(afile, asset);
                 if (bf == null) continue;
-                if (StripToVulkanOnly(bf))
+                if (StripToVulkanOnlyOrRejectGles(bf, $"{Path.GetFileName(inputPath)}:{asset.PathId}"))
                 {
                     asset.SetNewData(bf);
                     totalShaders++;
@@ -677,6 +690,30 @@ internal static class Program
 
         bf["compressedBlob.Array"].AsByteArray = vulkanSlice;
         return true;
+    }
+
+    /// <summary>
+    /// Keep the Vulkan slice, but reject a shader which has already been
+    /// destructively converted to GLES-only. Treating that case as the normal
+    /// "no Vulkan shader" pass-through would stamp the bundle Android while
+    /// the player is configured for Vulkan, yielding a package which only
+    /// fails later in Unity.
+    /// </summary>
+    static bool StripToVulkanOnlyOrRejectGles(AssetTypeValueField bf, string description)
+    {
+        if (StripToVulkanOnly(bf)) return true;
+
+        var platforms = bf["platforms.Array"];
+        for (int i = 0; i < platforms.AsArray.size; i++)
+        {
+            if (platforms[i].AsInt == 9)
+            {
+                throw new InvalidDataException(
+                    $"{description}: shader is GLES-only and cannot be restored to Vulkan; " +
+                    "restore the original Linux Addressables content before switching backends");
+            }
+        }
+        return false;
     }
 
 
