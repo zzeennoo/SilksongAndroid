@@ -42,6 +42,15 @@ object Il2cppConverter {
 
     data class Progress(val step: String, val fraction: Float, val detail: String = "")
 
+    /** Target and compatibility policy represented by every complete tree. */
+    private const val CONVERSION_CONTRACT = "android-arm64-release-system-io-fallback-v1"
+
+    private val TARGET_ARGS = listOf(
+        "--platform=Android",
+        "--architecture=ARM64",
+        "--configuration=Release",
+    )
+
     /**
      * The generated C++ and the player data.
      *
@@ -203,7 +212,7 @@ object Il2cppConverter {
      * replaced, since the run that wrote this.
      */
     private fun completionSignature(root: File): String =
-        "${cppDir(root).list()?.size ?: 0}:${metadata(root).length()}"
+        "$CONVERSION_CONTRACT|${cppDir(root).list()?.size ?: 0}:${metadata(root).length()}"
 
     private fun markComplete(root: File) {
         // Failing to write it costs a conversion that did not need to happen.
@@ -373,6 +382,15 @@ object Il2cppConverter {
             }
         }
 
+        // The unityaot profile's probe is supposed to catch an unavailable
+        // FileStream primitive and conservatively return false. On affected
+        // Android IL2CPP builds that exception escapes the static initializer
+        // instead, aborting the game before File.Exists can return. Remove the
+        // probe from every private PathInternal copy while the code is still
+        // managed IL. This command fails if it cannot find and prove them.
+        send(Progress("Patching System.IO", -1f, "case-insensitive fallback"))
+        patchSystemIoCaseSensitivity(context, root)
+
         prepareTool(deploy)
 
         val argv = ArrayList<String>()
@@ -388,6 +406,7 @@ object Il2cppConverter {
         argv += "--emit-null-checks"
         argv += "--enable-array-bounds-check"
         argv += "--static-lib-il2-cpp"
+        argv += TARGET_ARGS
 
         val expected = expectedSources(root)
         val log = File(root, "convert.log")
@@ -691,9 +710,19 @@ object Il2cppConverter {
         var fromBcl = 0
         var fromEngine = 0
         var fromDepot = 0
+        val excludedCoreLibraries = mutableListOf<File>()
+        val coreLibraries = setOf("mscorlib.dll", "system.private.corelib.dll")
         for ((source, counter) in listOf(bcl to 0, engine to 1, managed to 2)) {
             for (dll in source.listFiles().orEmpty()) {
                 if (!dll.isFile || !dll.name.endsWith(".dll")) continue
+                // unityaot-linux is the one conversion profile. A differently
+                // named System.Private.CoreLib from the Android player or the
+                // depot otherwise survives filename de-duplication and adds a
+                // competing System.IO.File/FileStream implementation.
+                if (counter > 0 && dll.name.lowercase() in coreLibraries) {
+                    excludedCoreLibraries += dll
+                    continue
+                }
                 val dst = File(out, dll.name)
                 if (dst.exists()) continue
                 dll.copyTo(dst, overwrite = true)
@@ -726,9 +755,30 @@ object Il2cppConverter {
             "assemblies: $fromBcl class library, $fromEngine engine, $fromDepot from the depot, " +
                 "$overridden rebuilt for Android, $added ours",
         )
+        if (excludedCoreLibraries.isNotEmpty()) {
+            LauncherLog.log(
+                "excluded competing core libraries: " +
+                    excludedCoreLibraries.joinToString { it.absolutePath },
+            )
+        }
         val all = out.listFiles().orEmpty().filter { it.name.endsWith(".dll") }.sortedBy { it.name }
         if (all.isEmpty()) throw IOException("no assemblies were staged into $out")
         return all
+    }
+
+    /** Patch and audit the exact staged graph that IL2CPP will consume. */
+    private suspend fun patchSystemIoCaseSensitivity(
+        context: android.content.Context,
+        root: File,
+    ) {
+        val surgery = PlayerImage.stageSurgery(root, context.assets)
+        for (command in listOf("patch-system-io-case-sensitivity", "audit-system-io")) {
+            PlayerImage.run(
+                surgery,
+                context,
+                listOf(command, asmDir(root).absolutePath),
+            ) { line -> LauncherLog.log("System.IO: ${line.trim()}") }
+        }
     }
 
     /**

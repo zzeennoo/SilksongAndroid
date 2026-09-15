@@ -23,12 +23,12 @@ from pathlib import Path
 
 UNITY_VERSION = "6000.0.50f1"
 PACKAGE = "com.jakobkhansen.silksong"
-PC_BUILD_CONTRACT = "android-full-system-io-v3"
-# v3 tightens only the linked-ELF audit.  A cached v2 generated tree has
-# already passed the complete source-graph audit and remains valid; it is the
-# native object cache that must be rebuilt.  Keep this separate from the ZIP
-# contract so fixing packaging/auditing does not repeat IL-to-C++ conversion.
-CONVERSION_CACHE_CONTRACT = "android-full-system-io-v2"
+PC_BUILD_CONTRACT = "android-system-io-fallback-v4"
+# The staged unityaot assemblies are now patched before conversion, so their
+# digest already invalidates an older C++ tree. Keep a named contract as well:
+# it makes the reason explicit and prevents a coincidental input hash match
+# from ever crossing this compatibility boundary.
+CONVERSION_CACHE_CONTRACT = "android-system-io-fallback-v1"
 CONTENT_ROOT = f"/data/user/0/{PACKAGE}/files/aa"
 ROSLYN_VERSION = "4.12.0"
 ROSLYN_BYTES = 21_775_071
@@ -396,13 +396,22 @@ def verify_system_io(repo: Path, cpp: Path) -> None:
     Run the same guard over that exact tree before either accepting a cache or
     spending hours compiling it.
     """
-    run([sys.executable, str(repo / "tools/pc-builder/verify-system-io.py"), str(cpp)])
+    run([
+        sys.executable, str(repo / "tools/pc-builder/verify-system-io.py"), str(cpp),
+        "--require-case-insensitive-fallback",
+    ])
 
 
 def verify_managed_system_io(repo: Path, asm: Path) -> None:
     """Report System.IO owners and reject competing File/FileStream core types."""
     surgery = repo / "tools/bundle-surgery/bin/Release/net8.0/BundleSurgery.dll"
     run(["dotnet", str(surgery), "audit-system-io", str(asm)])
+
+
+def patch_managed_system_io(repo: Path, asm: Path) -> None:
+    """Remove the launch-time filesystem probe from every PathInternal copy."""
+    surgery = repo / "tools/bundle-surgery/bin/Release/net8.0/BundleSurgery.dll"
+    run(["dotnet", str(surgery), "patch-system-io-case-sensitivity", str(asm)])
 
 
 def tree_digest(directory: Path) -> str:
@@ -429,6 +438,7 @@ def convert(repo: Path, unity: Path, root: Path, asm: Path, jobs: int) -> tuple[
     weaver = repo / "tools/mod-weaver/bin/Release/net8.0/ModWeaver.dll"
     run(["dotnet", str(surgery), "redirect-file-replace", str(asm / "Assembly-CSharp.dll"), str(asm / "SilksongIo.dll")])
     run(["dotnet", str(weaver), "builtin", "--assemblies", str(asm)])
+    patch_managed_system_io(repo, asm)
     verify_managed_system_io(repo, asm)
 
     cpp = root / "cpp"
@@ -514,6 +524,7 @@ def compile_native(repo: Path, unity: Path, root: Path, jobs: int) -> Path:
         "--binary", str(output),
         "--nm", str(host / "bin/llvm-nm"),
         "--objdump", str(host / "bin/llvm-objdump"),
+        "--require-case-insensitive-fallback",
     ])
     note(f"linked libil2cpp SHA-256: {sha256(output)}")
     return output

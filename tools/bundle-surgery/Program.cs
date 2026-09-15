@@ -56,8 +56,9 @@ internal static class Program
             Console.Error.WriteLine("  set-build-version <globalgamemanagers> <version> — set BuildSettings.m_Version (must match the SerializedFile version)");
             Console.Error.WriteLine("  patch-catalog-path <in.bin> <out.bin> <abs-path> — repoint an Addressables catalog's content root at an absolute path");
             Console.Error.WriteLine("  redirect-file-replace <Assembly-CSharp.dll> <SilksongIo.dll> — point the game's File.Replace calls at SafeIo (fixes saving where ReplaceFile is unsupported)");
+            Console.Error.WriteLine("  patch-system-io-case-sensitivity <assembly-dir> — replace every PathInternal case probe with its safe Android fallback");
             Console.Error.WriteLine("  audit-system-io <assembly-dir>                  — report launch-critical System.IO type owners");
-            Console.Error.WriteLine("  retarget-tree <src-dir> <dst-dir>               — extract-vulkan-android over a whole bundle tree, in parallel, resumable");
+            Console.Error.WriteLine("  retarget-tree <src-dir> <dst-dir> [progress]    — extract-vulkan-android over a whole bundle tree, in parallel, resumable");
             Console.Error.WriteLine();
             Console.Error.WriteLine("inspection (diagnostic):");
             return 2;
@@ -70,8 +71,10 @@ internal static class Program
             "set-build-version" when args.Length >= 3 => SetBuildVersion(args[1], args[2]),
             "patch-catalog-path" when args.Length >= 4 => PatchCatalogPath(args[1], args[2], args[3]),
             "redirect-file-replace" when args.Length >= 3 => RedirectFileReplace.Run(args[1], args[2]),
+            "patch-system-io-case-sensitivity" when args.Length >= 2 => PatchSystemIoCaseSensitivity.Run(args[1]),
             "audit-system-io" when args.Length >= 2 => SystemIoAudit.Run(args[1]),
-            "retarget-tree" when args.Length >= 3 => RetargetTree(args[1], args[2]),
+            "retarget-tree" when args.Length >= 3 => RetargetTree(
+                args[1], args[2], args.Length >= 4 ? args[3] : null),
             "extract-vulkan-android" when args.Length >= 3 => ExtractVulkanAndroid(args[1], args[2]),
             "shader-report" when args.Length >= 2 => ShaderReport(args[1]),
             _ => Usage(),
@@ -92,7 +95,7 @@ internal static class Program
     // temporary file and moved into place, and existing outputs are skipped,
     // so an interrupted run resumes rather than restarting -- worth having for
     // a multi-gigabyte job.
-    static int RetargetTree(string srcRoot, string dstRoot)
+    static int RetargetTree(string srcRoot, string dstRoot, string? progressPath)
     {
         srcRoot = Path.GetFullPath(srcRoot);
         dstRoot = Path.GetFullPath(dstRoot);
@@ -112,11 +115,39 @@ internal static class Program
             return 1;
         }
 
-        Console.Error.WriteLine($"  {inputs.Length} bundle(s) → {(inPlace ? "in place" : dstRoot)}");
+        Console.WriteLine($"  {inputs.Length} bundle(s) → {(inPlace ? "in place" : dstRoot)}");
 
-        int done = 0, skipped = 0, failed = 0;
+        int done = 0, skipped = 0, failed = 0, processed = 0;
         var errors = new System.Collections.Concurrent.ConcurrentBag<string>();
         var sw = System.Diagnostics.Stopwatch.StartNew();
+        var progressLock = new object();
+        int lastReported = -1;
+
+        void Report(bool complete = false)
+        {
+            var n = Volatile.Read(ref processed);
+            lock (progressLock)
+            {
+                if (!complete && n <= lastReported) return;
+                lastReported = n;
+                if (progressPath is not null)
+                {
+                    var full = Path.GetFullPath(progressPath);
+                    Directory.CreateDirectory(Path.GetDirectoryName(full)!);
+                    var temp = full + ".tmp";
+                    File.WriteAllText(
+                        temp,
+                        $"total={inputs.Length}\nprocessed={n}\nchanged={Volatile.Read(ref done)}\n" +
+                        $"skipped={Volatile.Read(ref skipped)}\nfailed={Volatile.Read(ref failed)}\n" +
+                        $"complete={(complete ? 1 : 0)}\n");
+                    File.Move(temp, full, overwrite: true);
+                }
+                Console.WriteLine($"  {n} / {inputs.Length}  ({sw.Elapsed.TotalSeconds:N0}s)");
+                Console.Out.Flush();
+            }
+        }
+
+        Report();
 
         Parallel.ForEach(inputs, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, input =>
         {
@@ -148,13 +179,17 @@ internal static class Program
                 }
             }
 
-            int n = done + skipped + failed;
-            if (n % 100 == 0)
-                Console.Error.WriteLine($"  {n} / {inputs.Length}  ({sw.Elapsed.TotalSeconds:N0}s)");
+            int n = Interlocked.Increment(ref processed);
+            // A small sidecar receipt is the primary progress channel on
+            // Android.  Console output remains useful on a PC and as a log,
+            // but has been lost by some embedded-runtime/stdout combinations.
+            if (n == 1 || n % 25 == 0 || n == inputs.Length) Report();
         });
 
         sw.Stop();
-        Console.Error.WriteLine($"  {done} retargeted, {skipped} already Android or present, {failed} failed  in {sw.Elapsed.TotalSeconds:N0}s");
+        Report(complete: true);
+        Console.WriteLine($"  {done} retargeted, {skipped} already Android or present, {failed} failed  in {sw.Elapsed.TotalSeconds:N0}s");
+        Console.Out.Flush();
         foreach (var e in errors.Take(10)) Console.Error.WriteLine($"    ✗ {e}");
         return failed > 0 ? 1 : 0;
     }

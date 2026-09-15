@@ -82,15 +82,18 @@ if [[ "$MODE" == il2cpp-smoke ]]; then
     # on Android during PathInternal's static initializer.
     fetch_unity editor
     smoke=$(mktemp -d)
-    mkdir -p "$smoke/cpp" "$smoke/data"
+    mkdir -p "$smoke/cpp" "$smoke/data" "$smoke/asm"
     deploy="$UNITY_PLAYER_ROOT/editor/Editor/Data/il2cpp/build/deploy"
     bcl="$UNITY_PLAYER_ROOT/editor/Editor/Data/MonoBleedingEdge/lib/mono/unityaot-linux"
     say "building the managed System.IO assembly audit"
     dotnet build -c Release tools/bundle-surgery/BundleSurgery.csproj --nologo -v quiet
-    dotnet tools/bundle-surgery/bin/Release/net8.0/BundleSurgery.dll audit-system-io "$bcl"
+    cp "$bcl"/*.dll "$smoke/asm/"
+    dotnet tools/bundle-surgery/bin/Release/net8.0/BundleSurgery.dll \
+        patch-system-io-case-sensitivity "$smoke/asm"
+    dotnet tools/bundle-surgery/bin/Release/net8.0/BundleSurgery.dll audit-system-io "$smoke/asm"
     chmod +x "$deploy/il2cpp"
     say "smoke-testing Unity's desktop IL2CPP host"
-    mapfile -t bcl_assemblies < <(find "$bcl" -maxdepth 1 -type f -name '*.dll' | sort)
+    mapfile -t bcl_assemblies < <(find "$smoke/asm" -maxdepth 1 -type f -name '*.dll' | sort)
     il2cpp_assemblies=()
     for assembly in "${bcl_assemblies[@]}"; do
         il2cpp_assemblies+=("--assembly=$assembly")
@@ -121,7 +124,8 @@ if [[ "$MODE" == il2cpp-smoke ]]; then
     # Guard the exact runtime regression this smoke test is for. The platform
     # selection controls ICallMapping; without Android here, PathInternal's
     # FileStream constructor was emitted as il2cpp's unsupported-method stub.
-    python3 tools/pc-builder/verify-system-io.py "$smoke/cpp"
+    python3 tools/pc-builder/verify-system-io.py "$smoke/cpp" \
+        --require-case-insensitive-fallback
     say "desktop IL2CPP smoke conversion passed"
     exit 0
 fi

@@ -156,7 +156,7 @@ class PcBuilderTests(unittest.TestCase):
             previous.update(b"same assemblies")
             self.assertNotEqual(previous.hexdigest(), current)
 
-    def test_strict_binary_guard_reuses_verified_v2_conversion(self):
+    def test_case_sensitivity_fallback_invalidates_verified_v2_conversion(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "mscorlib.dll").write_bytes(b"same assemblies")
@@ -169,8 +169,74 @@ class PcBuilderTests(unittest.TestCase):
                 verified_v2.update(b"\0")
             verified_v2.update(b"mscorlib.dll\0")
             verified_v2.update(b"same assemblies")
-            self.assertEqual(verified_v2.hexdigest(), current)
+            self.assertNotEqual(verified_v2.hexdigest(), current)
             self.assertNotEqual(pc_builder.PC_BUILD_CONTRACT, pc_builder.CONVERSION_CACHE_CONTRACT)
+
+    def test_system_io_guard_accepts_constant_false_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "mscorlib.cpp").write_text(
+                """
+                bool PathInternal_GetIsCaseSensitive_mAAAA() {
+                    return (bool)0;
+                }
+                void FileStream__ctor_mBBBB() {
+                    il2cpp_codegen_get_not_supported_exception("unused FileStream overload");
+                }
+                """,
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    sys.executable, str(VERIFY_SYSTEM_IO), str(root),
+                    "--require-case-insensitive-fallback",
+                ],
+                text=True, capture_output=True,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("constant false fallback", result.stdout)
+
+    def test_system_io_guard_requires_every_pathinternal_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "System.cpp").write_text(
+                """
+                bool PathInternal_GetIsCaseSensitive_mAAAA() { return false; }
+                bool PathInternal_GetIsCaseSensitive_mDDDD() { FileStream__ctor_mBBBB(); }
+                void FileStream__ctor_mBBBB() { open_file(); }
+                """,
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    sys.executable, str(VERIFY_SYSTEM_IO), str(root),
+                    "--require-case-insensitive-fallback",
+                ],
+                text=True, capture_output=True,
+            )
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("PathInternal_GetIsCaseSensitive_mDDDD", result.stderr)
+
+    def test_binary_guard_rejects_old_pathinternal_object_after_fallback_patch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "System.cpp").write_text(
+                """
+                bool PathInternal_GetIsCaseSensitive_mAAAA() { return (bool)0; }
+                void FileStream__ctor_mBBBB() { open_file(); }
+                """,
+                encoding="utf-8",
+            )
+            analysis = system_io_verifier.analyze_sources(
+                root, require_case_insensitive_fallback=True,
+            )
+            defined = analysis["paths"] | analysis["ctors"]
+            graph = {
+                "PathInternal_GetIsCaseSensitive_mAAAA": {"FileStream__ctor_mBBBB"},
+                "FileStream__ctor_mBBBB": set(),
+            }
+            with self.assertRaisesRegex(SystemExit, "patched .* still calls FileStream"):
+                system_io_verifier.verify_binary_graph(analysis, defined, graph)
 
     def test_system_io_guard_follows_delegating_constructor(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -426,12 +492,12 @@ class PcBuilderTests(unittest.TestCase):
         host = ndk / "toolchains/llvm/prebuilt/linux-x86_64"
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            # This is the tree the audit is asked to trust: BBBB delegates to
-            # the implemented CCCC constructor, while DDDD is an unreachable
-            # platform stub that must never enter the linked path.
+            # This is the tree the audit is asked to trust: PathInternal has
+            # been patched to the constant fallback. The old constructors may
+            # still exist, but none may be reachable from that root.
             (root / "System.IO.cpp").write_text(
                 """
-                bool PathInternal_GetIsCaseSensitive_mAAAA() { FileStream__ctor_mBBBB(); }
+                bool PathInternal_GetIsCaseSensitive_mAAAA() { return (bool)0; }
                 void FileStream__ctor_mBBBB() { FileStream__ctor_mCCCC(); }
                 void FileStream__ctor_mCCCC() { open_file(); }
                 void FileStream__ctor_mDDDD() {
@@ -440,9 +506,9 @@ class PcBuilderTests(unittest.TestCase):
                 """,
                 encoding="utf-8",
             )
-            # Deliberately link a different BBBB body, mirroring the device's
-            # observed CF0 -> 158 stale-object path.  The .cc suffix keeps this
-            # fixture out of the generated-source scan.
+            # Deliberately link the old PathInternal and BBBB bodies, mirroring
+            # the device's observed CF0 -> 158 stale-object path. The .cc
+            # suffix keeps this fixture out of the generated-source scan.
             linked = root / "linked.cc"
             linked.write_text(
                 """
@@ -471,10 +537,11 @@ class PcBuilderTests(unittest.TestCase):
                 "--binary", str(binary),
                 "--nm", str(host / "bin/llvm-nm"),
                 "--objdump", str(host / "bin/llvm-objdump"),
+                "--require-case-insensitive-fallback",
             ], capture_output=True, text=True)
             self.assertNotEqual(0, result.returncode)
-            self.assertIn("FileStream__ctor_mBBBB has stale constructor edge(s)", result.stderr)
-            self.assertIn("FileStream__ctor_mDDDD", result.stderr)
+            self.assertIn("patched PathInternal_GetIsCaseSensitive_mAAAA still calls FileStream", result.stderr)
+            self.assertIn("FileStream__ctor_mBBBB", result.stderr)
 
     def test_bundle_uses_the_importers_exact_entry_names(self):
         with tempfile.TemporaryDirectory() as tmp:

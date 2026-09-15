@@ -52,6 +52,33 @@ object PlayerImage {
 
     data class Progress(val step: String, val fraction: Float, val detail: String = "")
 
+    internal data class RetargetReport(
+        val total: Int,
+        val processed: Int,
+        val changed: Int,
+        val skipped: Int,
+        val failed: Int,
+        val complete: Boolean,
+    )
+
+    internal fun parseRetargetReport(text: String): RetargetReport? = runCatching {
+        val values = text.lineSequence().mapNotNull { line ->
+            val cut = line.indexOf('=')
+            if (cut <= 0) null else line.substring(0, cut) to line.substring(cut + 1)
+        }.toMap()
+        fun number(name: String): Int = values[name]?.toIntOrNull()
+            ?.takeIf { it >= 0 } ?: error("missing $name")
+        val complete = when (values["complete"]) {
+            "0" -> false
+            "1" -> true
+            else -> error("missing complete")
+        }
+        RetargetReport(
+            number("total"), number("processed"), number("changed"),
+            number("skipped"), number("failed"), complete,
+        )
+    }.getOrNull()
+
     private const val SURGERY_ASSET_DIR = "ondevice/bundle-surgery"
     private const val SURGERY_DLL = "BundleSurgery.dll"
 
@@ -497,23 +524,14 @@ object PlayerImage {
         // number rather than from the first bundle a hundred bundles later.
         send(Progress("Retargeting content", 0f, "0 of $total bundles"))
 
-        // What has actually been rewritten, counted off the tree.
-        //
-        // The reader below was meant to be this, and cannot be: retarget-tree
-        // prints nothing this side of the runtime -- the per-group line in the
-        // log came back empty on a Retroid Pocket Flip 2, after a run that
-        // rewrote all 2068 bundles perfectly well. Whatever it says goes
-        // nowhere we can see, and with one group holding the whole tree the
-        // bar could then only move once, at the end. It read 0% for seven
-        // minutes of a working retarget.
-        //
-        // The files answer without being asked. A bundle rewritten after this
-        // started has an mtime to prove it, and that is true whatever the tool
-        // does or does not print. Both paths report through [publish], so the
-        // reader still wins if it ever has something to say.
-        val startedAt = System.currentTimeMillis()
+        // Progress means scanned, not rewritten. The older fallback counted
+        // files whose mtimes changed; on a resumed AYANEO run only 16 bundles
+        // needed changes, so the screen sat at 16 / 2068 while the tool quite
+        // correctly inspected every remaining already-Android bundle. A small
+        // sidecar written by bundle-surgery survives embedded-runtime stdout
+        // loss and distinguishes those two numbers.
         val seen = java.util.concurrent.atomic.AtomicInteger(0)
-        fun publish(n: Int) {
+        fun publish(n: Int, changed: Int? = null) {
             if (n <= 0 || n < seen.get()) return
             seen.set(n)
             // Never quite full: the step ends when the tool returns, not when
@@ -522,45 +540,68 @@ object PlayerImage {
                 Progress(
                     "Retargeting content",
                     (n.toFloat() / total).coerceAtMost(0.99f),
-                    "$n of $total bundles",
+                    buildString {
+                        append("$n of $total scanned")
+                        if (changed != null) append("; $changed changed")
+                    },
                 ),
             )
         }
 
-        val ticker = launch(Dispatchers.IO) {
-            while (isActive) {
-                delay(RETARGET_POLL_MS)
-                publish(
-                    aa.walkTopDown().count {
-                        it.isFile && it.name.endsWith(".bundle") && it.lastModified() >= startedAt
-                    },
-                )
+        var changed = 0
+        val receipt = File(root, "retarget.progress")
+        for (group in groups) {
+            coroutineContext.ensureActive()
+            val count = counts.getValue(group)
+            if (count == 0) continue
+            val before = finished
+            val changedBefore = changed
+            receipt.delete()
+            val ticker = launch(Dispatchers.IO) {
+                while (isActive) {
+                    delay(RETARGET_POLL_MS)
+                    val report = runCatching { parseRetargetReport(receipt.readText()) }.getOrNull()
+                    if (report != null) {
+                        publish(before + report.processed, changedBefore + report.changed)
+                    }
+                }
             }
-        }
-
-        try {
-            for (group in groups) {
-                coroutineContext.ensureActive()
-                val count = counts.getValue(group)
-                if (count == 0) continue
-                val before = finished
-                // What retarget-tree is documented to print: "  N / M  (Ts)"
-                // every hundred bundles, which exec folds in with stdout. It
-                // has never been seen to arrive; the count above is what
-                // actually moves the bar, and this is kept only because it
-                // costs nothing and would be the better answer if it came.
-                val r = run(surgery, context, listOf("retarget-tree", group.absolutePath, group.absolutePath)) { line ->
-                    PROGRESS.find(line)?.let { m ->
-                        val n = m.groupValues[1].toIntOrNull() ?: return@let
+            val r = try {
+                run(
+                    surgery,
+                    context,
+                    listOf(
+                        "retarget-tree", group.absolutePath, group.absolutePath,
+                        receipt.absolutePath,
+                    ),
+                ) { line ->
+                    PROGRESS.find(line)?.let { match ->
+                        val n = match.groupValues[1].toIntOrNull() ?: return@let
                         publish(before + n)
                     }
                 }
-                finished += count
-                LauncherLog.log("retargeted ${group.name}: ${r.output.trim().lines().lastOrNull()}")
-                publish(finished)
+            } finally {
+                ticker.cancel()
             }
-        } finally {
-            ticker.cancel()
+            val report = runCatching { parseRetargetReport(receipt.readText()) }.getOrNull()
+                ?: throw IOException("retarget-tree produced no readable completion receipt")
+            val classified = report.changed.toLong() + report.skipped + report.failed
+            if (!report.complete || report.total != count || report.processed != count ||
+                classified != report.processed.toLong() || report.failed != 0
+            ) {
+                throw IOException(
+                    "retarget-tree completion mismatch: expected $count, " +
+                        "processed ${report.processed}/${report.total}, failed ${report.failed}",
+                )
+            }
+            finished += count
+            changed += report.changed
+            val finalLine = r.output.trim().lines().lastOrNull()
+            LauncherLog.log(
+                "retargeted ${group.name}: ${report.changed} changed, ${report.skipped} already Android" +
+                    (if (finalLine.isNullOrEmpty()) "" else "; $finalLine"),
+            )
+            publish(finished, changed)
         }
         // Recomputed rather than reused: the run just rewrote these files, so
         // the stamp that identifies "already retargeted" is the state they are
@@ -572,14 +613,12 @@ object PlayerImage {
     private val PROGRESS = Regex("""^\s*(\d+)\s*/\s*(\d+)\s""")
 
     /**
-     * How often the bundle tree is counted while the retarget runs.
+     * How often the retarget progress receipt is read.
      *
-     * A pass over a couple of thousand files, so not free -- and it competes
-     * with the work it is measuring, on the same storage. Slow enough not to
-     * matter, often enough that a stalled step is obvious within a screenful
-     * of waiting.
+     * The receipt is a few lines in the build directory, so polling it does
+     * not walk or contend with the multi-gigabyte content tree.
      */
-    private const val RETARGET_POLL_MS = 5_000L
+    private const val RETARGET_POLL_MS = 1_000L
 
     // ── the depot ──────────────────────────────────────────────────────────
 

@@ -44,14 +44,16 @@ are downloaded. Docker volumes retain them, the signing key, the generated C++
 and native objects. Later runs are incremental and APKs remain installable over
 one another because the local signing key is stable.
 
-Before native compilation, the builder reports which staged assemblies define
-the launch-critical `System.IO` types and rejects competing `File` or
-`FileStream` core definitions. (`unityaot-linux` intentionally has private
-`PathInternal` implementations in multiple assemblies.) It then audits every
-generated `PathInternal.GetIsCaseSensitive` definition and reachable
-`FileStream` constructor. After linking, the same audit is repeated against the
-ARM64 ELF symbol/call graph. A ZIP is written only when the linked graph matches
-the generated source graph.
+Before conversion, the builder reports which staged assemblies define the
+launch-critical `System.IO` types and rejects competing `File` or `FileStream`
+core definitions. (`unityaot-linux` intentionally has private `PathInternal`
+implementations in multiple assemblies.) It rewrites every
+`PathInternal.GetIsCaseSensitive()` body to the method's conservative fallback,
+`false`, avoiding the temporary-`FileStream` probe that aborts on the affected
+Android 11 runtime. The generated-source audit requires every copy to be that
+exact constant fallback. After linking, the ARM64 ELF audit requires every
+`PathInternal` symbol to have no `FileStream` edge. A ZIP is written only when
+both proofs pass.
 
 The final build prints `linked libil2cpp SHA-256` and `signed ZIP libil2cpp
 SHA-256`; they must be identical. The importer hashes the installed private
@@ -59,9 +61,10 @@ copy again and records the full digest in `PC build installed: ...`, so that log
 can be compared byte-for-byte with both PC lines and identifies bytes on the
 device rather than merely repeating a manifest value.
 
-The stricter v3 audit reuses a v2 generated C++ tree after rechecking it, but
-advances the native object-cache signature and rebuilds those objects once.
-No cache or Docker volume needs to be deleted manually.
+The fallback patch changes the staged managed assemblies and advances the
+conversion contract, so an older generated tree is not reused. Native objects
+remain content-addressed and rebuild as their generated translation units
+change. No cache or Docker volume needs to be deleted manually.
 
 Use `-Jobs 4` to override the automatic worker count. By default the builder
 uses about one worker per 2 GiB available to Docker, capped at eight, so a

@@ -20,6 +20,10 @@ EDGE_TARGET_RE = re.compile(
     r"(?:PathInternal_GetIsCaseSensitive|FileStream__ctor)_m[0-9A-F]+|"
     + re.escape(UNSUPPORTED)
 )
+CONSTANT_FALSE_BODY_RE = re.compile(
+    r"\{\s*return\s+(?:(?:\(\s*bool\s*\)\s*)?0(?:[uUlL]*)|false)\s*;\s*\}",
+    re.IGNORECASE,
+)
 
 
 def _balanced_end(text: str, start: int, opening: str, closing: str) -> int | None:
@@ -89,6 +93,12 @@ def definitions(text: str, pattern: re.Pattern[str]) -> list[tuple[str, str, int
     return found
 
 
+def is_constant_false_body(body: str) -> bool:
+    """True only for the exact C++ shape emitted by ``ldc.i4.0; ret``."""
+    without_comments = re.sub(r"//[^\n]*(?:\n|$)|/\*.*?\*/", "", body, flags=re.S)
+    return CONSTANT_FALSE_BODY_RE.fullmatch(without_comments.strip()) is not None
+
+
 def _transitive(graph: dict[str, set[str]], symbol: str) -> set[str]:
     result: set[str] = set()
     pending = list(graph.get(symbol, ()))
@@ -101,7 +111,7 @@ def _transitive(graph: dict[str, set[str]], symbol: str) -> set[str]:
     return result
 
 
-def analyze_sources(root: Path) -> dict[str, object]:
+def analyze_sources(root: Path, require_case_insensitive_fallback: bool = False) -> dict[str, object]:
     sources = sorted(root.rglob("*.cpp")) + sorted(root.rglob("*.c"))
     if not sources:
         raise SystemExit(f"IL2CPP System.IO audit: no generated sources under {root}")
@@ -133,12 +143,29 @@ def analyze_sources(root: Path) -> dict[str, object]:
             if UNSUPPORTED in body:
                 direct_unsupported.add(symbol)
 
-    roots_without_ctor = [symbol for symbol in path_definitions if not graph[symbol]]
+    # Every definition of a symbol must be the fallback before the symbol is
+    # classified as patched. A duplicate old body is exactly what this audit
+    # exists to keep out of the linker.
+    patched_paths = {
+        symbol for symbol, items in path_definitions.items()
+        if all(is_constant_false_body(body) for _, body, _ in items)
+    }
+    roots_without_ctor = [
+        symbol for symbol in path_definitions
+        if not graph[symbol] and symbol not in patched_paths
+    ]
     if roots_without_ctor:
         raise SystemExit(
             "IL2CPP System.IO audit: PathInternal definition(s) call no recognizable "
             "FileStream constructor: " + ", ".join(sorted(roots_without_ctor))
         )
+    if require_case_insensitive_fallback:
+        unpatched = set(path_definitions) - patched_paths
+        if unpatched:
+            raise SystemExit(
+                "IL2CPP System.IO audit: PathInternal case-sensitivity fallback was not "
+                "applied to: " + ", ".join(sorted(unpatched))
+            )
 
     # Resolve the union of every definition for every symbol. A second body is
     # exactly the dangerous case: accepting the first one lets the linker pick
@@ -188,6 +215,7 @@ def analyze_sources(root: Path) -> dict[str, object]:
         "unsafe": unsafe,
         "reachable": reachable,
         "locations": locations,
+        "patched_paths": patched_paths,
         "path_definition_count": sum(map(len, path_definitions.values())),
         "reachable_definition_count": sum(
             len(ctor_definitions[symbol]) for symbol in reachable if symbol in ctor_definitions
@@ -270,6 +298,7 @@ def verify_binary_graph(
     source_ctors: set[str] = analysis["ctors"]  # type: ignore[assignment]
     source_graph: dict[str, set[str]] = analysis["graph"]  # type: ignore[assignment]
     unsafe: set[str] = analysis["unsafe"]  # type: ignore[assignment]
+    patched_paths: set[str] = analysis["patched_paths"]  # type: ignore[assignment]
 
     binary_paths = {symbol for symbol in defined if symbol.startswith("PathInternal_GetIsCaseSensitive_m")}
     binary_ctors = {symbol for symbol in defined if symbol.startswith("FileStream__ctor_m")}
@@ -289,7 +318,12 @@ def verify_binary_graph(
             raise SystemExit(f"IL2CPP binary audit: objdump did not disassemble {root}")
         allowed = _transitive(source_graph, root)
         actual = {called for called in binary_graph[root] if called in source_ctors}
-        if not actual:
+        if root in patched_paths and actual:
+            raise SystemExit(
+                f"IL2CPP binary audit: patched {root} still calls FileStream in the linked ELF: "
+                + ", ".join(sorted(actual))
+            )
+        if root not in patched_paths and not actual:
             raise SystemExit(f"IL2CPP binary audit: {root} has no visible FileStream call in the linked ELF")
         unexpected = actual - allowed
         if unexpected:
@@ -378,11 +412,19 @@ def main() -> None:
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--nm", type=Path)
     parser.add_argument("--objdump", type=Path)
+    parser.add_argument(
+        "--require-case-insensitive-fallback",
+        action="store_true",
+        help="require every PathInternal.GetIsCaseSensitive body to return false directly",
+    )
     args = parser.parse_args()
     if args.binary is not None and (args.nm is None or args.objdump is None):
         parser.error("--binary requires --nm and --objdump")
 
-    analysis = analyze_sources(args.generated_cpp_dir)
+    analysis = analyze_sources(
+        args.generated_cpp_dir,
+        require_case_insensitive_fallback=args.require_case_insensitive_fallback,
+    )
     print(
         f"[docker] verified generated System.IO graph: "
         f"{analysis['path_definition_count']} PathInternal definition(s), "
@@ -391,7 +433,9 @@ def main() -> None:
     locations: dict[str, list[str]] = analysis["locations"]  # type: ignore[assignment]
     graph: dict[str, set[str]] = analysis["graph"]  # type: ignore[assignment]
     for symbol in sorted(analysis["paths"]):
-        print(f"[docker]   {symbol} [{', '.join(locations[symbol])}] -> {', '.join(sorted(graph[symbol]))}")
+        target = "<constant false fallback>" if symbol in analysis["patched_paths"] else \
+            ", ".join(sorted(graph[symbol]))
+        print(f"[docker]   {symbol} [{', '.join(locations[symbol])}] -> {target}")
     for symbol in sorted(analysis["reachable"]):
         called = ", ".join(sorted(graph[symbol])) or "<implemented terminal>"
         print(f"[docker]   {symbol} [{', '.join(locations[symbol])}] -> {called}")
