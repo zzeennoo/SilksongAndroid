@@ -13,11 +13,13 @@ using UnityEngine;
 public static class LowMemoryProfile
 {
     public const int MEMORY_LIMIT_MB = 3200;
-    public const int MAX_FRAME_RATE = 60;
-    public const int MAX_RENDER_SHORT_SIDE = 720;
+    public const int MAX_FRAME_RATE = 30;
+    public const int MAX_RENDER_SHORT_SIDE = 540;
+    public const int MIN_TEXTURE_MIP_LIMIT = 1;
 
     static int _memoryMb = int.MinValue;
     static bool _announced;
+    static bool _graphicsApplied;
 
     public static int MemoryMb
     {
@@ -38,7 +40,47 @@ public static class LowMemoryProfile
         Debug.Log(
             $"[LowMemoryProfile] enabled: memory={MemoryMb}MB, " +
             $"shader warmup=off, frame cap={MAX_FRAME_RATE}, " +
-            $"render short side<={MAX_RENDER_SHORT_SIDE}");
+            $"render short side<={MAX_RENDER_SHORT_SIDE}, " +
+            $"texture mip limit>={MIN_TEXTURE_MIP_LIMIT}, AA=off");
+    }
+
+    /// <summary>
+    /// Reduce allocations that live in the graphics driver rather than in the
+    /// managed or native heaps reported by dumpsys meminfo.
+    ///
+    /// On the 3 GB AYANEO, native heap stayed near 48 MB while MemAvailable
+    /// fell by 1.6 GB and CmaFree reached zero immediately before Android's
+    /// low-memory killer removed the foreground game. Vulkan/ION allocations
+    /// are substantially under-counted by per-process PSS on this device, so
+    /// heap-only tuning cannot address that failure mode.
+    /// </summary>
+    public static void ApplyGraphicsLimits()
+    {
+        if (_graphicsApplied || !Enabled) return;
+        _graphicsApplied = true;
+
+        try
+        {
+            int oldMipLimit = QualitySettings.globalTextureMipmapLimit;
+            int oldAa = QualitySettings.antiAliasing;
+
+            // One mip level means half the width and height for mipmapped
+            // textures, cutting their top-level allocation to one quarter.
+            // Do not relax a stricter value the player or project already set.
+            if (QualitySettings.globalTextureMipmapLimit < MIN_TEXTURE_MIP_LIMIT)
+                QualitySettings.globalTextureMipmapLimit = MIN_TEXTURE_MIP_LIMIT;
+            QualitySettings.antiAliasing = 0;
+            QualitySettings.anisotropicFiltering = AnisotropicFiltering.Disable;
+
+            Debug.Log(
+                $"[LowMemoryProfile] graphics limits: texture mip limit " +
+                $"{oldMipLimit}->{QualitySettings.globalTextureMipmapLimit}, " +
+                $"AA {oldAa}->{QualitySettings.antiAliasing}, anisotropic=off");
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogWarning("[LowMemoryProfile] couldn't apply graphics limits: " + ex.Message);
+        }
     }
 }
 #endif

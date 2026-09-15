@@ -63,6 +63,7 @@ public static class ResolutionConfigurator
     static void Apply()
     {
         LowMemoryProfile.Announce();
+        LowMemoryProfile.ApplyGraphicsLimits();
         ApplyFrameRate();
         PinLandscape();
         ApplyDefaultResolution();
@@ -219,7 +220,7 @@ public static class ResolutionConfigurator
     }
 
     /**
-     * 720p once on an ordinary device; a 720p ceiling on a low-memory one.
+     * 720p once on an ordinary device; a 540p ceiling on a low-memory one.
      *
      * The marker is ours rather than Unity's. Unity writes its own
      * "Screenmanager Resolution Width" on first run too -- with the panel's
@@ -265,18 +266,22 @@ public static class ResolutionConfigurator
                 return;
             }
 
-            // A panel already at or below the default is left alone: there is
+            int targetShort = LowMemoryProfile.Enabled
+                ? LowMemoryProfile.MAX_RENDER_SHORT_SIDE
+                : DEFAULT_SHORT_SIDE;
+
+            // A panel already at or below the target is left alone: there is
             // nothing to save, and scaling UP would be worse than doing nothing.
-            if (shortSide > DEFAULT_SHORT_SIDE)
+            if (shortSide > targetShort)
             {
                 // Derived through the same pair of helpers the menu uses, so
                 // this lands exactly on one of its rows rather than a pixel
                 // beside it.
-                int width = ResolutionMenuOptions.WidthFor(longSide, shortSide, DEFAULT_SHORT_SIDE);
-                Screen.SetResolution(width, DEFAULT_SHORT_SIDE, true);
+                int width = ResolutionMenuOptions.WidthFor(longSide, shortSide, targetShort);
+                Screen.SetResolution(width, targetShort, true);
                 string reason = LowMemoryProfile.Enabled ? "low-memory cap" : "first-run default";
                 Debug.Log(
-                    $"[ResolutionConfigurator] {reason}: using {width}x{DEFAULT_SHORT_SIDE} " +
+                    $"[ResolutionConfigurator] {reason}: using {width}x{targetShort} " +
                     $"(window {longSide}x{shortSide})");
             }
             else
@@ -284,7 +289,7 @@ public static class ResolutionConfigurator
                 string reason = LowMemoryProfile.Enabled ? "low-memory cap" : "first run";
                 Debug.Log(
                     $"[ResolutionConfigurator] {reason}: window is {longSide}x{shortSide}, " +
-                    "already at or below the default; leaving it alone");
+                    "already at or below the target; leaving it alone");
             }
 
             // Written whether or not the resolution was changed. The question
@@ -785,6 +790,7 @@ public class ResolutionMenuOptions : MonoBehaviour
 public class ResolutionGuard : MonoBehaviour
 {
     const float CHECK_SECONDS = 0.5f;
+    const int MAX_CORRECTION_ATTEMPTS = 3;
     // Two frames whose aspects are this close are the same picture; correcting
     // between them would be a rounding error with a Screen.SetResolution
     // attached to it.
@@ -799,8 +805,10 @@ public class ResolutionGuard : MonoBehaviour
 
     static ResolutionGuard _instance;
     float _next;
-    int _triedLong, _triedShort;
+    int _requestedLong, _requestedShort;
+    int _attempts;
     bool _reported;
+    bool _failureReported;
 
     public static void Install()
     {
@@ -838,20 +846,12 @@ public class ResolutionGuard : MonoBehaviour
 
         if (!portrait && !wrongShape && !tooLarge)
         {
-            // Fits. Forget any attempt made for an earlier window, so that a
-            // window which comes back to a shape we once failed on is tried
-            // again rather than written off.
-            _triedLong = 0;
-            _triedShort = 0;
+            if (_attempts > 0)
+                Debug.Log($"[ResolutionGuard] confirmed {Screen.width}x{Screen.height} after "
+                          + $"{_attempts} correction attempt(s)");
+            ResetAttempts();
             return;
         }
-
-        // Tried already, for this exact window. Either the correction did not
-        // take or something is re-applying it, and repeating it every half
-        // second would turn a cosmetic problem into a flickering one.
-        if (winLong == _triedLong && winShort == _triedShort) return;
-        _triedLong = winLong;
-        _triedShort = winShort;
 
         int shortSide = Mathf.Min(haveShort, winShort);
         if (LowMemoryProfile.Enabled)
@@ -859,9 +859,45 @@ public class ResolutionGuard : MonoBehaviour
         int longSide = ResolutionMenuOptions.WidthFor(winLong, winShort, shortSide);
         if (longSide == Screen.width && shortSide == Screen.height) return;
 
+        // Screen.SetResolution is asynchronous on Android. The old guard
+        // remembered only the window size and therefore interpreted one call
+        // as success forever, even when Screen.width/height never changed. A
+        // bounded retry verifies the observable result without flickering in
+        // an endless tug-of-war with the game or the device.
+        if (longSide != _requestedLong || shortSide != _requestedShort)
+        {
+            _requestedLong = longSide;
+            _requestedShort = shortSide;
+            _attempts = 0;
+            _failureReported = false;
+        }
+
+        if (_attempts >= MAX_CORRECTION_ATTEMPTS)
+        {
+            if (!_failureReported)
+            {
+                _failureReported = true;
+                Debug.LogWarning(
+                    $"[ResolutionGuard] FAILED to apply {longSide}x{shortSide}; " +
+                    $"Unity still reports {Screen.width}x{Screen.height} after {_attempts} attempts");
+            }
+            return;
+        }
+
+        _attempts++;
+
         Debug.Log($"[ResolutionGuard] {Screen.width}x{Screen.height} does not fit a "
-                  + $"{winLong}x{winShort} window; using {longSide}x{shortSide}");
+                  + $"{winLong}x{winShort} window; requesting {longSide}x{shortSide} "
+                  + $"(attempt {_attempts}/{MAX_CORRECTION_ATTEMPTS})");
         Screen.SetResolution(longSide, shortSide, true);
+    }
+
+    void ResetAttempts()
+    {
+        _requestedLong = 0;
+        _requestedShort = 0;
+        _attempts = 0;
+        _failureReported = false;
     }
 
     /**
@@ -920,7 +956,7 @@ public class ResolutionGuard : MonoBehaviour
  * value at or below zero can only be the "off" sentinel, which Unity reads on
  * Android as 30. Replacing just that is the ordinary job, and it happens within
  * a frame rather than within three seconds. LowMemoryProfile also supplies a
- * positive maximum: on a 3 GB device the game's stored 120 fps is held at 60.
+ * positive maximum: on a 3 GB device the game's stored 120 fps is held at 30.
  */
 public class FrameCapHolder : MonoBehaviour
 {
