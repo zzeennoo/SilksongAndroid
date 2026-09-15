@@ -39,6 +39,8 @@ internal static class PatchSystemIoCaseSensitivity
             var changed = false;
             try
             {
+                using var resolver = new DefaultAssemblyResolver();
+                resolver.AddSearchDirectory(Path.GetFullPath(assemblyDirectory));
                 using (var assembly = AssemblyDefinition.ReadAssembly(path, new ReaderParameters
                 {
                     // Immediate mode materializes unrelated method signatures
@@ -47,6 +49,7 @@ internal static class PatchSystemIoCaseSensitivity
                     // only need bodies in the exact PathInternal type below.
                     ReadingMode = ReadingMode.Deferred,
                     ReadSymbols = false,
+                    AssemblyResolver = resolver,
                 }))
                 {
                     foreach (var type in AllTypes(assembly.MainModule.Types))
