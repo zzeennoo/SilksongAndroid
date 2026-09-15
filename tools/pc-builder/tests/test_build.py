@@ -196,6 +196,20 @@ class PcBuilderTests(unittest.TestCase):
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertIn("constant false fallback", result.stdout)
 
+    def test_system_io_guard_accepts_il2cpps_nested_false_cast(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "mscorlib.cpp").write_text(
+                "bool PathInternal_GetIsCaseSensitive_mAAAA() { return ((bool)0); }",
+                encoding="utf-8",
+            )
+            analysis = system_io_verifier.analyze_sources(
+                root, require_case_insensitive_fallback=True,
+            )
+            self.assertEqual(
+                {"PathInternal_GetIsCaseSensitive_mAAAA"}, analysis["patched_paths"],
+            )
+
     def test_system_io_guard_requires_every_pathinternal_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

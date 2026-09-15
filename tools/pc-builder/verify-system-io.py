@@ -20,10 +20,6 @@ EDGE_TARGET_RE = re.compile(
     r"(?:PathInternal_GetIsCaseSensitive|FileStream__ctor)_m[0-9A-F]+|"
     + re.escape(UNSUPPORTED)
 )
-CONSTANT_FALSE_BODY_RE = re.compile(
-    r"\{\s*return\s+(?:(?:\(\s*bool\s*\)\s*)?0(?:[uUlL]*)|false)\s*;\s*\}",
-    re.IGNORECASE,
-)
 
 
 def _balanced_end(text: str, start: int, opening: str, closing: str) -> int | None:
@@ -96,7 +92,30 @@ def definitions(text: str, pattern: re.Pattern[str]) -> list[tuple[str, str, int
 def is_constant_false_body(body: str) -> bool:
     """True only for the exact C++ shape emitted by ``ldc.i4.0; ret``."""
     without_comments = re.sub(r"//[^\n]*(?:\n|$)|/\*.*?\*/", "", body, flags=re.S)
-    return CONSTANT_FALSE_BODY_RE.fullmatch(without_comments.strip()) is not None
+    statement = re.fullmatch(
+        r"\{\s*return\s+(.+?)\s*;\s*\}", without_comments.strip(), re.S,
+    )
+    if statement is None:
+        return False
+    expression = re.sub(r"\s+", "", statement.group(1))
+    # Unity IL2CPP versions have emitted all of these for the same two IL
+    # instructions: false, (bool)0, ((bool)0), and static_cast<bool>(0).
+    # Normalize only those harmless wrappers. The full-body match above still
+    # rejects declarations, branches, calls, or any second statement.
+    while True:
+        if expression.startswith("(") and _balanced_end(expression, 0, "(", ")") == len(expression):
+            expression = expression[1:-1]
+            continue
+        cast = re.match(r"^\((?:bool|int32_t)\)(.+)$", expression)
+        if cast:
+            expression = cast.group(1)
+            continue
+        static_cast = re.fullmatch(r"static_cast<(?:bool|int32_t)>\((.+)\)", expression)
+        if static_cast:
+            expression = static_cast.group(1)
+            continue
+        break
+    return expression.lower() == "false" or re.fullmatch(r"0[uUlL]*", expression) is not None
 
 
 def _transitive(graph: dict[str, set[str]], symbol: str) -> set[str]:
