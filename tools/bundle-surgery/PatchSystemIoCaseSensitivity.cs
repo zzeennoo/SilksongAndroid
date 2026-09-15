@@ -41,9 +41,12 @@ internal static class PatchSystemIoCaseSensitivity
             {
                 using (var assembly = AssemblyDefinition.ReadAssembly(path, new ReaderParameters
                 {
-                    ReadingMode = ReadingMode.Immediate,
+                    // Immediate mode materializes unrelated method signatures
+                    // and tries to resolve optional dependencies (for example
+                    // Mono.Data.Sqlite -> System.Security.Permissions). We
+                    // only need bodies in the exact PathInternal type below.
+                    ReadingMode = ReadingMode.Deferred,
                     ReadSymbols = false,
-                    InMemory = true,
                 }))
                 {
                     foreach (var type in AllTypes(assembly.MainModule.Types))
