@@ -73,6 +73,7 @@ Android SDK and a JDK, but not a game depot or a running Unity player.
 | `TrapProbe` | live on-device diagnosis for stuck props; off unless asked for |
 | `AndroidRumble` | vibration: the game mixes it, Android never played it |
 | `InputProbe` | live on-device diagnosis for dropped inputs; off unless asked for |
+| `LowMemoryProfile` | automatic <=3 GB safety limits: lazy shaders, 60 fps, max 720p |
 | `ShaderWarmup` | prewarm shader variants to cut first-encounter hitches |
 | `InventoryTouchInput` | touch control for the game's own inventory |
 | `PerfOverlay`, `ProfilerTopMarkers` | on-device performance readouts |

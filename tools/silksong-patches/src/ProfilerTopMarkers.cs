@@ -27,6 +27,17 @@ public class ProfilerTopMarkers : MonoBehaviour
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterAssembliesLoaded)]
     static void Bootstrap()
     {
+        // Recorder enumeration is diagnostic instrumentation. It was useful in
+        // identifying the AYANEO stall, but keeping every available time marker
+        // live is the wrong default on the device whose memory we are trying to
+        // protect.
+        if (LowMemoryProfile.Enabled)
+        {
+            LowMemoryProfile.Announce();
+            Debug.Log("[ProfTop] disabled on low-memory device");
+            return;
+        }
+
         var go = new GameObject("ProfilerTopMarkers");
         DontDestroyOnLoad(go);
         go.AddComponent<ProfilerTopMarkers>();

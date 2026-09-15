@@ -62,6 +62,7 @@ public static class ResolutionConfigurator
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
     static void Apply()
     {
+        LowMemoryProfile.Announce();
         ApplyFrameRate();
         PinLandscape();
         ApplyDefaultResolution();
@@ -179,10 +180,13 @@ public static class ResolutionConfigurator
     {
         try
         {
-            int cap = LargestAcceptedCap();
+            int largest = LargestAcceptedCap();
+            int cap = LowMemoryProfile.Enabled
+                ? Mathf.Min(largest, LowMemoryProfile.MAX_FRAME_RATE)
+                : largest;
 
             int stored = PlayerPrefs.GetInt(PREF_FRAME_CAP, -1);
-            if (stored <= 0)
+            if (stored <= 0 || (LowMemoryProfile.Enabled && stored > cap))
             {
                 // Still written, so the options menu shows something true when
                 // it reads the pref fresh. Not relied on: see the note above.
@@ -202,9 +206,11 @@ public static class ResolutionConfigurator
             PlayerPrefs.Save();
 
             QualitySettings.vSyncCount = 0;
-            Application.targetFrameRate = stored > 0 ? stored : cap;
+            int selected = stored > 0 ? stored : cap;
+            if (LowMemoryProfile.Enabled && selected > cap) selected = cap;
+            Application.targetFrameRate = selected;
 
-            FrameCapHolder.Install(cap);
+            FrameCapHolder.Install(cap, LowMemoryProfile.Enabled ? cap : 0);
         }
         catch (System.Exception ex)
         {
@@ -213,7 +219,7 @@ public static class ResolutionConfigurator
     }
 
     /**
-     * 720p, once, on a device that has never run this before.
+     * 720p once on an ordinary device; a 720p ceiling on a low-memory one.
      *
      * The marker is ours rather than Unity's. Unity writes its own
      * "Screenmanager Resolution Width" on first run too -- with the panel's
@@ -221,9 +227,10 @@ public static class ResolutionConfigurator
      * chosen anything. A key only this code writes is the only way to tell
      * "never been here" from "been here, and the player picked native".
      *
-     * After this has run once it never runs again, and the resolution belongs
-     * to the game: its own menu writes Screenmanager Resolution Width/Height,
-     * Unity restores them at boot, and nothing here interferes.
+     * After this has run once it never runs again on an ordinary device, and
+     * the resolution belongs to the game. On a <=3 GB device the system logs
+     * show that native resolution contributes to a device-wide stall, so the
+     * cap is reapplied at boot and ResolutionGuard holds it afterward.
      *
      * ALWAYS landscape. Android reports some panels as 1080x1920 -- portrait,
      * the orientation the hardware is mounted in -- so deriving the target's
@@ -242,7 +249,7 @@ public static class ResolutionConfigurator
             ResolutionGuard.Install();
             ResolutionMenuOptions.Install();
 
-            if (PlayerPrefs.GetInt(PREF_DEFAULT_APPLIED, 0) != 0)
+            if (!LowMemoryProfile.Enabled && PlayerPrefs.GetInt(PREF_DEFAULT_APPLIED, 0) != 0)
             {
                 Debug.Log($"[ResolutionConfigurator] resolution is the game's: {Screen.width}x{Screen.height}");
                 return;
@@ -267,14 +274,16 @@ public static class ResolutionConfigurator
                 // beside it.
                 int width = ResolutionMenuOptions.WidthFor(longSide, shortSide, DEFAULT_SHORT_SIDE);
                 Screen.SetResolution(width, DEFAULT_SHORT_SIDE, true);
+                string reason = LowMemoryProfile.Enabled ? "low-memory cap" : "first-run default";
                 Debug.Log(
-                    $"[ResolutionConfigurator] first run: defaulting to {width}x{DEFAULT_SHORT_SIDE} " +
-                    $"(window {longSide}x{shortSide}). Change it in the game's video options.");
+                    $"[ResolutionConfigurator] {reason}: using {width}x{DEFAULT_SHORT_SIDE} " +
+                    $"(window {longSide}x{shortSide})");
             }
             else
             {
+                string reason = LowMemoryProfile.Enabled ? "low-memory cap" : "first run";
                 Debug.Log(
-                    $"[ResolutionConfigurator] first run: window is {longSide}x{shortSide}, " +
+                    $"[ResolutionConfigurator] {reason}: window is {longSide}x{shortSide}, " +
                     "already at or below the default; leaving it alone");
             }
 
@@ -659,18 +668,27 @@ public class ResolutionMenuOptions : MonoBehaviour
 
         var sizes = new System.Collections.Generic.List<Resolution>();
 
+        int maxShort = LowMemoryProfile.Enabled
+            ? LowMemoryProfile.MAX_RENDER_SHORT_SIDE
+            : int.MaxValue;
+
         // The window itself, first: the one entry that needs no scaling at all.
-        AddSize(sizes, winLong, winShort, current);
+        // On a low-memory device native resolution is deliberately not offered
+        // when it exceeds the survival cap.
+        if (winShort <= maxShort)
+            AddSize(sizes, winLong, winShort, current);
 
         // Then whatever is running, which need not be any of these -- a size
         // chosen on the other screen of a foldable, or one stored by an older
         // build. It is the entry the menu cannot do without: RefreshCurrentIndex
         // prepends a duplicate of it otherwise.
-        AddSize(sizes, Screen.width, Screen.height, current);
+        if (Mathf.Min(Screen.width, Screen.height) <= maxShort)
+            AddSize(sizes, Screen.width, Screen.height, current);
 
         for (int i = 0; i < ShortSides.Length; i++)
         {
             int target = ShortSides[i];
+            if (target > maxShort) continue;
             if (target >= winShort) continue;
             int w = WidthFor(winLong, winShort, target);
             // A window whose short side is 904 would otherwise be offered
@@ -815,8 +833,10 @@ public class ResolutionGuard : MonoBehaviour
         float want = winLong / (float)winShort;
         float have = haveLong / (float)haveShort;
         bool wrongShape = Mathf.Abs(want - have) / want > TOLERANCE;
+        bool tooLarge = LowMemoryProfile.Enabled
+            && haveShort > LowMemoryProfile.MAX_RENDER_SHORT_SIDE;
 
-        if (!portrait && !wrongShape)
+        if (!portrait && !wrongShape && !tooLarge)
         {
             // Fits. Forget any attempt made for an earlier window, so that a
             // window which comes back to a shape we once failed on is tried
@@ -834,6 +854,8 @@ public class ResolutionGuard : MonoBehaviour
         _triedShort = winShort;
 
         int shortSide = Mathf.Min(haveShort, winShort);
+        if (LowMemoryProfile.Enabled)
+            shortSide = Mathf.Min(shortSide, LowMemoryProfile.MAX_RENDER_SHORT_SIDE);
         int longSide = ResolutionMenuOptions.WidthFor(winLong, winShort, shortSide);
         if (longSide == Screen.width && shortSide == Screen.height) return;
 
@@ -896,22 +918,30 @@ public class ResolutionGuard : MonoBehaviour
  * player's chosen cap by assigning Application.targetFrameRate directly, so a
  * positive value already IS their choice, whatever it is, and is left alone. A
  * value at or below zero can only be the "off" sentinel, which Unity reads on
- * Android as 30. Replacing just that is the whole job, and it happens within a
- * frame rather than within three seconds.
+ * Android as 30. Replacing just that is the ordinary job, and it happens within
+ * a frame rather than within three seconds. LowMemoryProfile also supplies a
+ * positive maximum: on a 3 GB device the game's stored 120 fps is held at 60.
  */
 public class FrameCapHolder : MonoBehaviour
 {
     static FrameCapHolder _instance;
     int _cap;
+    int _maximum;
 
-    public static void Install(int cap)
+    public static void Install(int cap, int maximum)
     {
-        if (_instance != null) { _instance._cap = cap; return; }
+        if (_instance != null)
+        {
+            _instance._cap = cap;
+            _instance._maximum = maximum;
+            return;
+        }
 
         var go = new GameObject("__FrameCapHolder__");
         DontDestroyOnLoad(go);
         _instance = go.AddComponent<FrameCapHolder>();
         _instance._cap = cap;
+        _instance._maximum = maximum;
     }
 
     void Update()
@@ -922,7 +952,9 @@ public class FrameCapHolder : MonoBehaviour
         // change it.
         if (QualitySettings.vSyncCount != 0) QualitySettings.vSyncCount = 0;
 
-        if (Application.targetFrameRate <= 0) Application.targetFrameRate = _cap;
+        int target = Application.targetFrameRate;
+        if (target <= 0 || (_maximum > 0 && target > _maximum))
+            Application.targetFrameRate = _cap;
     }
 }
 #endif

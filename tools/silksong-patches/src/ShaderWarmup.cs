@@ -14,6 +14,12 @@
 // into the load transition — where a brief pause is already
 // expected — and trades for smooth gameplay afterwards.
 //
+// That trade is wrong on a 3 GB device. The driver allocations made while
+// warming every loaded shader are not all charged to the app's PSS, and the
+// AYANEO's low-memory killer has been observed killing even the foreground
+// game while this work makes the whole device unresponsive. LowMemoryProfile
+// therefore leaves compilation lazy on those devices.
+//
 // We don't try to be clever about deduplication: subsequent
 // WarmupAllShaders calls on already-compiled shaders are cheap
 // (the Adreno driver checks its PSO cache and returns instantly).
@@ -34,6 +40,13 @@ public class ShaderWarmup : MonoBehaviour
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Bootstrap()
     {
+        if (LowMemoryProfile.Enabled)
+        {
+            LowMemoryProfile.Announce();
+            Debug.Log("[ShaderWarmup] skipped on low-memory device");
+            return;
+        }
+
         // The frame rate is ResolutionConfigurator's business; it runs earlier
         // (BeforeSceneLoad) and owns display settings generally.
         var go = new GameObject("__ShaderWarmup__");
