@@ -929,6 +929,7 @@ class SetupActivity : Activity() {
                 PlayerImage.retargetContent(
                     depot, this@SetupActivity, out, assets,
                     staged.graphicsApi, PcBuildImport.glesPatch(pkgDir),
+                    PcBuildImport.texturePatch(pkgDir),
                 )
                     .collect { setBusy(true, it.step, it.fraction, it.detail) }
 

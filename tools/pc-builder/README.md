@@ -55,6 +55,43 @@ keeps the safer 30 fps cap. This is an experimental compatibility path, not a
 claim that GLES is normally faster than Vulkan or that every scene will hold
 60 fps.
 
+### ETC2 textures (opt-in)
+
+If the texture report shows the depot's atlases as plain DXT1/DXT5, the PC
+can re-encode them into ETC2, which every Android GPU samples natively:
+
+```powershell
+.\Build-On-Windows.ps1 -Depot "D:\Games\Silksong-Linux" -TextureFormat ETC2
+```
+
+(or `ETC2` as an extra argument to `Build-On-Windows.cmd`, combinable with
+`OpenGLES3`). The conversion is same-size by construction: DXT1 becomes
+ETC2_RGB, or ETC2_RGBA1 where the payload uses one-bit transparency, and DXT5
+becomes ETC2_RGBA8, each 8 or 16 bytes per 4x4 block like the format it
+replaces. No offset, stream size or `m_CompleteImageSize` changes; only
+`m_TextureFormat` and the payload bytes do. Crunched formats, BC4/BC5/BC7,
+cubemaps, arrays and any texture whose payload size does not match its
+dimensions are left as they are and counted in the build's summary.
+
+The PC applies the player image's own textures directly and ships the
+Addressables textures as `texture-patches.zip` inside the PC build, which the
+device applies while it retargets the bundles: a byte copy, no encoding.
+Every written texture is parsed back and checked against the pack's digest;
+a mismatch fails that file rather than leaving it half converted. The pack
+can be several gigabytes, since it carries every atlas; the ZIP name gains
+`-ETC2`, the manifest records the converter contract, encoder, counts, bytes
+and the pack manifest's SHA-256, and the importer refuses a pack from a
+different converter revision.
+
+The encoder is this repository's own (`tools/bundle-surgery/Etc2.cs`, from
+the Khronos specification; see `NOTICE.md`). It emits ETC1 differential and
+individual modes and the planar mode, not T/H modes, so blocks that mix two
+unrelated colours inside a 2x4 sub-block lose some fidelity; the visible
+part of a sprite on a transparent background is fitted alone and stays
+sharp. Output is deterministic and the encoder revision is part of the
+contract, so a cached pack is reused only for the same depot and the same
+encoder.
+
 ### Texture report (read-only)
 
 The Linux depot is a desktop build, so its textures are DXT1/DXT5 (and
@@ -145,7 +182,8 @@ docker run --rm --platform linux/amd64 \
   -e PC_BUILD_JOBS=8 silksong-pc-builder:latest pc
 ```
 
-Add `-e PC_GRAPHICS_API=gles3` for the OpenGL ES build. Replace the trailing
+Add `-e PC_GRAPHICS_API=gles3` for the OpenGL ES build and
+`-e PC_TEXTURE_FORMAT=etc2` for ETC2 textures. Replace the trailing
 `pc` with `texture-report` (optionally with `-e PC_SKIP_PAYLOAD_SCAN=1`) for
 the read-only texture report; only the `/workspace`, `/game` and `/pc-output`
 mounts matter to it.

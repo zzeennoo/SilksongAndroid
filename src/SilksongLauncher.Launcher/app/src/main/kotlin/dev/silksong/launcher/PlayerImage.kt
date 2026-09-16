@@ -212,7 +212,7 @@ object PlayerImage {
      * is skipped moves nothing at all, so a tree that was current stays
      * current for as long as nothing else writes to it.
      */
-    private fun contentStamp(aa: File, graphicsApi: String, glesPatch: File?): String {
+    private fun contentStamp(aa: File, graphicsApi: String, glesPatch: File?, texturePatch: File? = null): String {
         var count = 0L
         var bytes = 0L
         var newest = 0L
@@ -224,7 +224,10 @@ object PlayerImage {
             if (m > newest) newest = m
         }
         val patchIdentity = glesPatch?.takeIf { it.isFile }?.let { "${it.length()}/${it.lastModified()}" } ?: "none"
-        return "$graphicsApi/$patchIdentity/$count/$bytes/$newest"
+        // A texture pack is part of the identity too: importing an ETC2 build
+        // over a native-retargeted tree (or the reverse) must retarget again.
+        val textureIdentity = texturePatch?.takeIf { it.isFile }?.let { "tex:${it.length()}/${it.lastModified()}" } ?: "tex:none"
+        return "$graphicsApi/$patchIdentity/$textureIdentity/$count/$bytes/$newest"
     }
 
     /**
@@ -483,8 +486,12 @@ object PlayerImage {
         assets: android.content.res.AssetManager,
         graphicsApi: String = PcBuildImport.GRAPHICS_VULKAN,
         glesPatch: File? = null,
+        texturePatch: File? = null,
     ): Flow<Progress> = channelFlow {
         val data = depotData(depot) ?: throw IOException("no player data under $depot")
+        // Present means apply. The pack's entries are relative to the data
+        // directory, which the tool needs to find each bundle's record.
+        val textures = texturePatch?.takeIf { it.isFile }
         val aa = File(data, "StreamingAssets/aa")
         if (!aa.isDirectory) throw IOException("no Addressables content at $aa")
 
@@ -519,7 +526,7 @@ object PlayerImage {
             )
         }
 
-        if (previousStamp == contentStamp(aa, graphicsApi, glesPatch)) {
+        if (previousStamp == contentStamp(aa, graphicsApi, glesPatch, textures)) {
             LauncherLog.log("content is already retargeted; skipping")
             send(Progress("Content ready", 1f, "already retargeted"))
             return@channelFlow
@@ -587,16 +594,17 @@ object PlayerImage {
                 }
             }
             val r = try {
+                val textureArgs = textures?.let { listOf("--textures", it.absolutePath, data.absolutePath) }.orEmpty()
                 val command = if (graphicsApi == PcBuildImport.GRAPHICS_GLES3) {
                     listOf(
                         "retarget-tree-gles", aa.absolutePath, group.absolutePath,
                         receipt.absolutePath, glesPatch!!.absolutePath,
-                    )
+                    ) + textureArgs
                 } else {
                     listOf(
                         "retarget-tree", group.absolutePath, group.absolutePath,
                         receipt.absolutePath,
-                    )
+                    ) + textureArgs
                 }
                 run(
                     surgery,
@@ -634,7 +642,7 @@ object PlayerImage {
         // Recomputed rather than reused: the run just rewrote these files, so
         // the stamp that identifies "already retargeted" is the state they are
         // in now, not the state they were in when the run started.
-        contentStampFile(root).writeText(contentStamp(aa, graphicsApi, glesPatch))
+        contentStampFile(root).writeText(contentStamp(aa, graphicsApi, glesPatch, textures))
         send(Progress("Content ready", 1f, "$total bundles"))
     }.flowOn(Dispatchers.IO)
 

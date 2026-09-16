@@ -30,6 +30,19 @@ internal static class Program
             ("report summary groups by format and totals savings", Summary),
             ("report summary output is deterministic", Deterministic),
             ("walker over a real fixture (optional)", RealFixture),
+            ("ETC2 planar word pins the signalling bits", PlanarBits),
+            ("ETC2 RGB round trip stays close to the source", Etc2RgbRoundTrip),
+            ("ETC2 RGBA8 round trip keeps alpha", Etc2Rgba8RoundTrip),
+            ("ETC2 RGBA1 keeps holes and opaque texels", Etc2Rgba1RoundTrip),
+            ("ETC2 encodes sub-4x4 and odd levels at the right size", Etc2OddLevels),
+            ("ETC2 output is deterministic", Etc2Deterministic),
+            ("DXT to ETC2 chain keeps every level's size", DxtToEtc2Chain),
+            ("ETC2 dump for an external decoder (optional)", Etc2Dump),
+            ("transcode keeps a DXT chain's exact length", TranscodeChain),
+            ("transcode picks RGBA1 for punch-through DXT1", TranscodeTarget),
+            ("patch pack round trip, audit and tamper detection", PackRoundTrip),
+            ("resource range patching leaves every other byte alone", RangePatch),
+            ("apply and verify on a real serialized file (optional)", ApplySerialized),
         };
         int failed = 0;
         foreach (var (name, run) in tests)
@@ -417,6 +430,7 @@ internal static class Program
     {
         string? fixture = Environment.GetEnvironmentVariable("SILKSONG_TEXTURE_FIXTURE");
         if (string.IsNullOrWhiteSpace(fixture)) throw new SkipException("SILKSONG_TEXTURE_FIXTURE not set");
+        if (!File.Exists(fixture) && !Directory.Exists(fixture)) throw new SkipException("fixture not present: " + fixture);
         string dir = Path.Combine(Path.GetTempPath(), "silksong-texture-fixture-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
         try
@@ -430,6 +444,415 @@ internal static class Program
             True(doc.Textures.Count > 0, "found textures");
             True(doc.Textures.All(t => t.ExpectedBytes < 0 || t.PayloadMatchesExpected || t.PayloadIssue != null || t.ConversionBlocker != null),
                 "every mismatch is explained");
+        }
+        finally { Directory.Delete(dir, recursive: true); }
+    }
+
+    // ── ETC2 ────────────────────────────────────────────────────────────────
+
+    static byte[] TestImage(int width, int height, int seed, bool alpha, bool holes)
+    {
+        // A gradient with a hard-edged shape and some noise: gradients want
+        // planar mode, the shape wants sub-blocks, the noise stops either
+        // from being trivially exact.
+        var rgba = new byte[width * height * 4];
+        var rng = new Random(seed);
+        for (int y = 0; y < height; y++)
+        for (int x = 0; x < width; x++)
+        {
+            int i = (y * width + x) * 4;
+            bool inShape = (x - width / 2) * (x - width / 2) + (y - height / 2) * (y - height / 2) < (width * height) / 6;
+            rgba[i] = (byte)Math.Clamp(x * 255 / Math.Max(1, width - 1) + rng.Next(-6, 7), 0, 255);
+            rgba[i + 1] = (byte)Math.Clamp(y * 255 / Math.Max(1, height - 1) + rng.Next(-6, 7), 0, 255);
+            rgba[i + 2] = (byte)(inShape ? 200 : 40);
+            rgba[i + 3] = (byte)(holes && ((x / 3 + y / 5) % 4 == 0) ? 0 : alpha ? Math.Clamp(128 + (x - y) * 4, 0, 255) : 255);
+        }
+        return rgba;
+    }
+
+    static double Psnr(byte[] a, byte[] b, int channels, int stride, bool skipTransparent)
+    {
+        double sum = 0; long n = 0;
+        for (int i = 0; i < a.Length; i += stride)
+        {
+            if (skipTransparent && a[i + 3] < 128) continue;
+            for (int c = 0; c < channels; c++) { double d = a[i + c] - b[i + c]; sum += d * d; n++; }
+        }
+        if (n == 0) return double.PositiveInfinity;
+        double mse = sum / n;
+        return mse == 0 ? double.PositiveInfinity : 10 * Math.Log10(255.0 * 255.0 / mse);
+    }
+
+    static void PlanarBits()
+    {
+        // Every combination of the blue bits that steer the overflow, and a
+        // few red/green values that steer the non-overflow.
+        for (int bo = 0; bo < 64; bo++)
+        for (int ro = 0; ro < 64; ro += 7)
+        for (int go = 0; go < 128; go += 13)
+        {
+            ulong w = Etc2.PackPlanar(ro, go, bo, 63 - ro, 127 - go, 63 - bo, ro, go, bo);
+            int r1 = (int)((w >> 59) & 0x1F), dr = (int)((w >> 56) & 7); if (dr >= 4) dr -= 8;
+            int g1 = (int)((w >> 51) & 0x1F), dg = (int)((w >> 48) & 7); if (dg >= 4) dg -= 8;
+            int b1 = (int)((w >> 43) & 0x1F), db = (int)((w >> 40) & 7); if (db >= 4) db -= 8;
+            True(r1 + dr is >= 0 and <= 31, $"red must not overflow (ro={ro})");
+            True(g1 + dg is >= 0 and <= 31, $"green must not overflow (go={go})");
+            True(b1 + db is < 0 or > 31, $"blue must overflow (bo={bo})");
+            True(((w >> 33) & 1) == 1, "diff bit set");
+        }
+        // A flat plane decodes back to itself.
+        var texels = new byte[64];
+        for (int p = 0; p < 16; p++) { texels[p * 4] = 0x84; texels[p * 4 + 1] = 0x42; texels[p * 4 + 2] = 0xC6; texels[p * 4 + 3] = 255; }
+        var block = new byte[8];
+        Etc2.EncodeRgbBlock(texels, block, punchThrough: false);
+        var back = new byte[64];
+        Etc2.DecodeRgbBlock(block, back, punchThrough: false);
+        for (int p = 0; p < 16; p++)
+        {
+            True(Math.Abs(back[p * 4] - 0x84) <= 4 && Math.Abs(back[p * 4 + 1] - 0x42) <= 2 && Math.Abs(back[p * 4 + 2] - 0xC6) <= 4, "flat block within quantisation");
+        }
+    }
+
+    static void Etc2RgbRoundTrip()
+    {
+        var src = TestImage(64, 48, 1, alpha: false, holes: false);
+        var encoded = Etc2.EncodeLevel(TextureFormats.ETC2_RGB, src, 64, 48);
+        Eq(16 * 12 * 8, encoded.Length, "size");
+        var back = Etc2.DecodeLevel(TextureFormats.ETC2_RGB, encoded, 64, 48);
+        double psnr = Psnr(src, back, 3, 4, false);
+        // The test image has a hard blue edge inside sub-blocks, which ETC1's
+        // ramps cannot follow; that is what T/H modes are for and they are
+        // not emitted. 27 dB is what this encoder does on it.
+        True(psnr > 27, $"RGB PSNR {psnr:0.0} dB on the hard-edged image");
+        for (int i = 3; i < back.Length; i += 4) True(back[i] == 255, "opaque");
+        // A smooth image is where planar and the ramps shine.
+        var smooth = new byte[64 * 64 * 4];
+        for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++)
+        {
+            int i = (y * 64 + x) * 4;
+            smooth[i] = (byte)(x * 4); smooth[i + 1] = (byte)(y * 4); smooth[i + 2] = (byte)(128 + (x + y)); smooth[i + 3] = 255;
+        }
+        var smoothBack = Etc2.DecodeLevel(TextureFormats.ETC2_RGB, Etc2.EncodeLevel(TextureFormats.ETC2_RGB, smooth, 64, 64), 64, 64);
+        double smoothPsnr = Psnr(smooth, smoothBack, 3, 4, false);
+        True(smoothPsnr > 40, $"smooth PSNR {smoothPsnr:0.0} dB");
+        Console.WriteLine($"      hard-edged {psnr:0.0} dB, smooth {smoothPsnr:0.0} dB");
+    }
+
+    static void Etc2Rgba8RoundTrip()
+    {
+        var src = TestImage(64, 64, 2, alpha: true, holes: false);
+        var encoded = Etc2.EncodeLevel(TextureFormats.ETC2_RGBA8, src, 64, 64);
+        Eq(16 * 16 * 16, encoded.Length, "size");
+        var back = Etc2.DecodeLevel(TextureFormats.ETC2_RGBA8, encoded, 64, 64);
+        // RGB is compared where it can be seen: under alpha 0 the encoder
+        // spends nothing, by design.
+        double rgb = Psnr(src, back, 3, 4, true);
+        True(rgb > 27, $"visible RGB PSNR {rgb:0.0} dB");
+        // A sprite: hard shape on a fully transparent background. The colour
+        // under alpha 0 is not fitted, so the visible edge is not blended
+        // with the background and stays sharp.
+        var sprite = new byte[32 * 32 * 4];
+        for (int y = 0; y < 32; y++) for (int x = 0; x < 32; x++)
+        {
+            int i = (y * 32 + x) * 4;
+            bool inside = (x - 16) * (x - 16) + (y - 16) * (y - 16) < 120;
+            sprite[i] = (byte)(inside ? 220 : 0); sprite[i + 1] = (byte)(inside ? 40 + x * 3 : 0); sprite[i + 2] = (byte)(inside ? 60 : 0);
+            sprite[i + 3] = (byte)(inside ? 255 : 0);
+        }
+        var spriteBack = Etc2.DecodeLevel(TextureFormats.ETC2_RGBA8, Etc2.EncodeLevel(TextureFormats.ETC2_RGBA8, sprite, 32, 32), 32, 32);
+        double visible = Psnr(sprite, spriteBack, 3, 4, true);
+        True(visible > 36, $"visible sprite PSNR {visible:0.0} dB");
+        Console.WriteLine($"      hard-edged {rgb:0.0} dB, sprite (visible texels) {visible:0.0} dB");
+        double alpha = 0; long n = 0;
+        for (int i = 3; i < src.Length; i += 4) { double d = src[i] - back[i]; alpha += d * d; n++; }
+        double alphaPsnr = 10 * Math.Log10(255.0 * 255.0 / Math.Max(1e-9, alpha / n));
+        True(alphaPsnr > 36, $"alpha PSNR {alphaPsnr:0.0} dB");
+        // A flat alpha block is exact.
+        var flat = new byte[64]; for (int p = 0; p < 16; p++) flat[p * 4 + 3] = 77;
+        var block = new byte[8]; Etc2.EncodeAlphaBlock(flat, block);
+        var dec = new byte[64]; Etc2.DecodeAlphaBlock(block, dec);
+        for (int p = 0; p < 16; p++) Eq((byte)77, dec[p * 4 + 3], "flat alpha exact");
+    }
+
+    static void Etc2Rgba1RoundTrip()
+    {
+        var src = TestImage(64, 64, 3, alpha: false, holes: true);
+        var encoded = Etc2.EncodeLevel(TextureFormats.ETC2_RGBA1, src, 64, 64);
+        Eq(16 * 16 * 8, encoded.Length, "size");
+        var back = Etc2.DecodeLevel(TextureFormats.ETC2_RGBA1, encoded, 64, 64);
+        for (int i = 3; i < src.Length; i += 4)
+            Eq(src[i] < 128 ? (byte)0 : (byte)255, back[i], $"alpha at texel {i / 4} is one bit");
+        double psnr = Psnr(src, back, 3, 4, true);
+        True(psnr > 27, $"opaque RGB PSNR {psnr:0.0} dB");
+        // A fully opaque image in RGBA1 must use opaque=1 blocks and decode opaque.
+        var opaque = TestImage(16, 16, 4, alpha: false, holes: false);
+        var back2 = Etc2.DecodeLevel(TextureFormats.ETC2_RGBA1, Etc2.EncodeLevel(TextureFormats.ETC2_RGBA1, opaque, 16, 16), 16, 16);
+        for (int i = 3; i < back2.Length; i += 4) Eq((byte)255, back2[i], "opaque stays opaque");
+    }
+
+    static void Etc2OddLevels()
+    {
+        foreach (var (w, h) in new[] { (1, 1), (2, 2), (3, 5), (5, 3), (4, 1), (9, 4), (7, 7) })
+        {
+            var src = TestImage(w, h, w * 31 + h, alpha: true, holes: false);
+            foreach (int f in new[] { TextureFormats.ETC2_RGB, TextureFormats.ETC2_RGBA1, TextureFormats.ETC2_RGBA8 })
+            {
+                var enc = Etc2.EncodeLevel(f, src, w, h);
+                Eq(TextureFormats.LevelSize(TextureFormats.Describe(f), w, h), (long)enc.Length, $"{w}x{h} format {f}");
+                var back = Etc2.DecodeLevel(f, enc, w, h);
+                Eq(w * h * 4, back.Length, "decoded size");
+            }
+        }
+    }
+
+    static void Etc2Deterministic()
+    {
+        var src = TestImage(32, 32, 9, alpha: true, holes: true);
+        foreach (int f in new[] { TextureFormats.ETC2_RGB, TextureFormats.ETC2_RGBA1, TextureFormats.ETC2_RGBA8 })
+        {
+            var a = Etc2.EncodeLevel(f, src, 32, 32);
+            var b = Etc2.EncodeLevel(f, src, 32, 32);
+            True(a.AsSpan().SequenceEqual(b), $"format {f} encodes identically twice");
+        }
+        // Pinned: a change in the encoder must show up here, and in EncoderVersion.
+        var pinned = Etc2.EncodeLevel(TextureFormats.ETC2_RGB, TestImage(8, 8, 5, false, false), 8, 8);
+        string hex = System.Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(pinned)).ToLowerInvariant();
+        Console.WriteLine("      pinned ETC2_RGB 8x8 digest " + hex);
+        Eq("silksong-etc2-1", Etc2.EncoderVersion, "encoder version");
+    }
+
+    static void DxtToEtc2Chain()
+    {
+        // Build a DXT5 mip chain by hand (any bytes are a valid DXT5 payload),
+        // decode each level, encode to ETC2_RGBA8 and check the chain sizes match.
+        int w = 20, h = 12, mips = 5;
+        var rng = new Random(11);
+        long total = 0;
+        var chain = new List<byte[]>();
+        for (int level = 0; level < mips; level++)
+        {
+            int lw = TextureFormats.MipDimension(w, level), lh = TextureFormats.MipDimension(h, level);
+            var payload = new byte[TextureFormats.LevelSize(Dxt5, lw, lh)];
+            rng.NextBytes(payload);
+            var rgba = Dxt.DecodeLevel(Dxt5, payload, lw, lh);
+            var etc = Etc2.EncodeLevel(TextureFormats.ETC2_RGBA8, rgba, lw, lh);
+            Eq(payload.Length, etc.Length, $"level {level} {lw}x{lh}");
+            chain.Add(etc);
+            total += etc.Length;
+        }
+        Eq(TextureFormats.ChainSize(Dxt5, w, h, mips), total, "whole chain");
+        Eq(TextureFormats.ChainSize(Etc2Rgba8, w, h, mips), total, "as ETC2");
+    }
+
+    static void Etc2Dump()
+    {
+        string? dir = Environment.GetEnvironmentVariable("SILKSONG_ETC2_DUMP");
+        if (string.IsNullOrWhiteSpace(dir)) throw new SkipException("SILKSONG_ETC2_DUMP not set");
+        Directory.CreateDirectory(dir);
+        int w = 64, h = 48;
+        var opaque = TestImage(w, h, 21, alpha: false, holes: false);
+        var alpha = TestImage(w, h, 22, alpha: true, holes: false);
+        var holes = TestImage(w, h, 23, alpha: false, holes: true);
+        File.WriteAllBytes(Path.Combine(dir, "src-rgb.rgba"), opaque);
+        File.WriteAllBytes(Path.Combine(dir, "src-rgba8.rgba"), alpha);
+        File.WriteAllBytes(Path.Combine(dir, "src-rgba1.rgba"), holes);
+        File.WriteAllBytes(Path.Combine(dir, "etc2-rgb.bin"), Etc2.EncodeLevel(TextureFormats.ETC2_RGB, opaque, w, h));
+        File.WriteAllBytes(Path.Combine(dir, "etc2-rgba8.bin"), Etc2.EncodeLevel(TextureFormats.ETC2_RGBA8, alpha, w, h));
+        File.WriteAllBytes(Path.Combine(dir, "etc2-rgba1.bin"), Etc2.EncodeLevel(TextureFormats.ETC2_RGBA1, holes, w, h));
+        File.WriteAllText(Path.Combine(dir, "dims.txt"), $"{w} {h}\n");
+    }
+
+    // ── transcode and patch packs ───────────────────────────────────────────
+
+    static TextureEntry DxtEntry(int format, int w, int h, int mips, byte[] payload, int? punchBlocks = null)
+    {
+        var e = Entry("tex", format, w, h, mips, payload: payload.Length);
+        if (punchBlocks != null) { e.Dxt1PunchThrough = punchBlocks > 0; e.Dxt1PunchThroughBlocks = punchBlocks.Value; }
+        var f = TextureFormats.Describe(format);
+        e.SuggestedTargetId = TextureFormats.SameSizeEtc2Target(f, e.Dxt1PunchThrough == true)!.Id;
+        return e;
+    }
+
+    static void TranscodeChain()
+    {
+        var rng = new Random(5);
+        int w = 36, h = 20, mips = 6;
+        var payload = new byte[TextureFormats.ChainSize(Dxt5, w, h, mips)];
+        rng.NextBytes(payload);
+        var entry = DxtEntry(TextureFormats.DXT5, w, h, mips, payload);
+        var etc = TextureTranscode.Transcode(entry, payload);
+        Eq(payload.Length, etc.Length, "same length");
+        Eq(TextureFormats.ETC2_RGBA8, entry.SuggestedTargetId!.Value, "target");
+        // Every level decodes at its own size.
+        int at = 0;
+        for (int level = 0; level < mips; level++)
+        {
+            int lw = TextureFormats.MipDimension(w, level), lh = TextureFormats.MipDimension(h, level);
+            int size = (int)TextureFormats.LevelSize(Etc2Rgba8, lw, lh);
+            var back = Etc2.DecodeLevel(TextureFormats.ETC2_RGBA8, etc.AsSpan(at, size), lw, lh);
+            Eq(lw * lh * 4, back.Length, $"level {level}");
+            at += size;
+        }
+        // A short payload is refused, never padded.
+        bool threw = false;
+        try { TextureTranscode.Transcode(entry, payload.AsSpan(0, payload.Length - 8).ToArray()); }
+        catch (InvalidDataException) { threw = true; }
+        True(threw, "short payload rejected");
+    }
+
+    static void TranscodeTarget()
+    {
+        // 8x8 DXT1: four blocks, one of them with a transparent texel.
+        var payload = Dxt1Block(Red, Blue, 0).Concat(Dxt1Block(Blue, Red, 0x3)).Concat(Dxt1Block(Red, Blue, 0)).Concat(Dxt1Block(Red, Blue, 0)).ToArray();
+        var entry = DxtEntry(TextureFormats.DXT1, 8, 8, 1, payload, punchBlocks: 1);
+        Eq(TextureFormats.ETC2_RGBA1, entry.SuggestedTargetId!.Value, "punch-through target");
+        var etc = TextureTranscode.Transcode(entry, payload);
+        var back = Etc2.DecodeLevel(TextureFormats.ETC2_RGBA1, etc, 8, 8);
+        var src = Dxt.DecodeLevel(Dxt1, payload, 8, 8);
+        for (int i = 3; i < src.Length; i += 4) Eq(src[i] == 0 ? (byte)0 : (byte)255, back[i], $"alpha kept at {i / 4}");
+        var opaque = DxtEntry(TextureFormats.DXT1, 8, 8, 1, payload, punchBlocks: 0);
+        Eq(TextureFormats.ETC2_RGB, opaque.SuggestedTargetId!.Value, "opaque target");
+    }
+
+    static string MakePack(string dir, TexturePatchManifest manifest, Dictionary<string, byte[]> blobs)
+    {
+        string blobRoot = Path.Combine(dir, "blobs");
+        Directory.CreateDirectory(blobRoot);
+        foreach (var (digest, bytes) in blobs) File.WriteAllBytes(Path.Combine(blobRoot, digest + ".bin"), bytes);
+        string pack = Path.Combine(dir, "textures.zip");
+        TextureTranscode.WritePack(pack, manifest, blobRoot);
+        return pack;
+    }
+
+    static string Sha(byte[] b) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(b)).ToLowerInvariant();
+
+    static void PackRoundTrip()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "silksong-pack-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var src = new byte[TextureFormats.ChainSize(Dxt5, 16, 8, 3)];
+            new Random(3).NextBytes(src);
+            var entry = DxtEntry(TextureFormats.DXT5, 16, 8, 3, src);
+            var blob = TextureTranscode.Transcode(entry, src);
+            var patch = new TexturePatch
+            {
+                AssetFile = "CAB-1", PathId = 7, Name = "atlas", Width = 16, Height = 8, MipCount = 3,
+                SourceFormat = TextureFormats.DXT5, TargetFormat = TextureFormats.ETC2_RGBA8,
+                Location = "stream", StreamPath = "archive:/CAB-1/CAB-1.resS", StreamOffset = 128, Size = src.Length,
+                SourceSha256 = Sha(src), BlobSha256 = Sha(blob),
+            };
+            var manifest = new TexturePatchManifest { FileCount = 1, TextureCount = 1, SourceBytes = src.Length, Etc2Bytes = src.Length };
+            manifest.Files["aa/x.bundle"] = new List<TexturePatch> { patch };
+            string pack = MakePack(dir, manifest, new() { [patch.BlobSha256] = blob });
+            Eq(0, TextureTranscode.Audit(pack), "audit passes");
+            using (var opened = new TextureTranscode.Pack(pack))
+            {
+                Eq(1, opened.Manifest.Files["aa/x.bundle"].Count, "manifest round trip");
+                Eq(TextureTranscode.Contract, opened.Manifest.Contract, "contract");
+                True(opened.Blob(patch.BlobSha256).AsSpan().SequenceEqual(blob), "blob round trip");
+                True(opened.ManifestSha256.Length == 64, "manifest digest");
+            }
+            // Same inputs, same pack bytes: the manifest hash is stable.
+            string again = MakePack(Path.Combine(dir, "b"), manifest, new() { [patch.BlobSha256] = blob });
+            using (var a = new TextureTranscode.Pack(pack)) using (var b = new TextureTranscode.Pack(again))
+                Eq(a.ManifestSha256, b.ManifestSha256, "deterministic manifest");
+
+            // A wrong-size record fails the audit.
+            var bad = new TexturePatchManifest { FileCount = 1, TextureCount = 1 };
+            bad.Files["aa/x.bundle"] = new List<TexturePatch> { new TexturePatch
+            {
+                AssetFile = "CAB-1", PathId = 7, Width = 16, Height = 8, MipCount = 3, SourceFormat = TextureFormats.DXT5,
+                TargetFormat = TextureFormats.ETC2_RGBA8, Location = "stream", Size = src.Length - 16, BlobSha256 = Sha(blob), SourceSha256 = Sha(src),
+            } };
+            string badPack = MakePack(Path.Combine(dir, "c"), bad, new() { [Sha(blob)] = blob });
+            bool threw = false;
+            try { TextureTranscode.Audit(badPack); } catch (InvalidDataException) { threw = true; }
+            True(threw, "size mismatch rejected");
+            // A tampered blob fails its digest.
+            var tampered = (byte[])blob.Clone(); tampered[5] ^= 0xFF;
+            string tamperedPack = MakePack(Path.Combine(dir, "d"), manifest, new() { [patch.BlobSha256] = tampered });
+            threw = false;
+            try { TextureTranscode.Audit(tamperedPack); } catch (InvalidDataException) { threw = true; }
+            True(threw, "tampered blob rejected");
+            // A wrong contract is refused at open.
+            var foreign = new TexturePatchManifest { Contract = "something-else", FileCount = 0, TextureCount = 0 };
+            string foreignPack = MakePack(Path.Combine(dir, "e"), foreign, new());
+            threw = false;
+            try { using var _ = new TextureTranscode.Pack(foreignPack); } catch (InvalidDataException) { threw = true; }
+            True(threw, "foreign contract rejected");
+        }
+        finally { Directory.Delete(dir, recursive: true); }
+    }
+
+    /// <summary>A fake field tree is not available without AssetsTools; the range arithmetic is what matters here.</summary>
+    static void RangePatch()
+    {
+        var resource = new byte[1024];
+        new Random(8).NextBytes(resource);
+        var before = (byte[])resource.Clone();
+        var blob = new byte[256];
+        new Random(9).NextBytes(blob);
+        blob.CopyTo(resource.AsSpan(512, 256));
+        for (int i = 0; i < 1024; i++)
+        {
+            if (i >= 512 && i < 768) Eq(blob[i - 512], resource[i], $"patched byte {i}");
+            else Eq(before[i], resource[i], $"untouched byte {i}");
+        }
+    }
+
+    static void ApplySerialized()
+    {
+        string? fixture = Environment.GetEnvironmentVariable("SILKSONG_TEXTURE_FIXTURE");
+        if (string.IsNullOrWhiteSpace(fixture)) throw new SkipException("SILKSONG_TEXTURE_FIXTURE not set");
+        if (!File.Exists(fixture)) throw new SkipException("fixture is not a single serialized file: " + fixture);
+        string dir = Path.Combine(Path.GetTempPath(), "silksong-apply-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(dir, "root"));
+        try
+        {
+            string classData = Path.Combine(AppContext.BaseDirectory, "classdata.tpk");
+            string copy = Path.Combine(dir, "root", Path.GetFileName(fixture));
+            File.Copy(fixture, copy);
+            // Find an inline block-compressed texture to swap for same-size bytes.
+            var entries = new System.Collections.Concurrent.ConcurrentBag<TextureEntry>();
+            var others = new System.Collections.Concurrent.ConcurrentDictionary<string, int>();
+            var payloads = new Dictionary<(string, long), byte[]>();
+            TextureReport.InspectSerialized(copy, Path.GetFileName(fixture), true, classData, entries, others, payloads);
+            var target = entries.FirstOrDefault(e => e.DataLocation == "inline" && e.PayloadBytes >= 64 && e.PayloadMatchesExpected
+                && TextureFormats.Describe(e.FormatId).IsBlockCompressed);
+            if (target == null) throw new SkipException("fixture has no inline block-compressed texture");
+            var src = payloads[(target.AssetFile, target.PathId)];
+            var blob = (byte[])src.Clone();
+            for (int i = 0; i < blob.Length; i++) blob[i] ^= 0x5A;
+            int targetFormat = target.FormatId == TextureFormats.ETC2_RGB ? TextureFormats.ETC2_RGBA1 : TextureFormats.ETC2_RGB;
+            var patch = new TexturePatch
+            {
+                AssetFile = target.AssetFile, PathId = target.PathId, Name = target.Name, Width = target.Width, Height = target.Height,
+                MipCount = target.MipCount, SourceFormat = target.FormatId, TargetFormat = targetFormat, Location = "inline",
+                Size = src.Length, SourceSha256 = Sha(src), BlobSha256 = Sha(blob),
+            };
+            var manifest = new TexturePatchManifest { FileCount = 1, TextureCount = 1 };
+            manifest.Files[Path.GetFileName(fixture)] = new List<TexturePatch> { patch };
+            string pack = MakePack(dir, manifest, new() { [patch.BlobSha256] = blob });
+
+            Eq(0, TextureTranscode.ApplyToSerialized(Path.Combine(dir, "root"), pack, classData), "apply");
+            // Parse back independently of the verifier.
+            var after = new System.Collections.Concurrent.ConcurrentBag<TextureEntry>();
+            var afterPayloads = new Dictionary<(string, long), byte[]>();
+            TextureReport.InspectSerialized(copy, Path.GetFileName(fixture), true, classData, after, others, afterPayloads);
+            var changed = after.Single(e => e.PathId == target.PathId);
+            Eq(targetFormat, changed.FormatId, "format flipped");
+            True(afterPayloads[(target.AssetFile, target.PathId)].AsSpan().SequenceEqual(blob), "bytes swapped");
+            Eq(after.Count, entries.Count, "no asset lost");
+            // Every other texture is byte-identical.
+            foreach (var e in entries.Where(e => e.PathId != target.PathId && payloads.ContainsKey((e.AssetFile, e.PathId))))
+                True(afterPayloads[(e.AssetFile, e.PathId)].AsSpan().SequenceEqual(payloads[(e.AssetFile, e.PathId)]), $"untouched {e.Name}");
+            // Second run: already applied, nothing rewritten.
+            long mtime = new FileInfo(copy).LastWriteTimeUtc.Ticks;
+            Eq(0, TextureTranscode.ApplyToSerialized(Path.Combine(dir, "root"), pack, classData), "reapply");
+            Eq(mtime, new FileInfo(copy).LastWriteTimeUtc.Ticks, "idempotent: file untouched");
+            Console.WriteLine($"      applied to {target.Name} ({target.Format} {target.Width}x{target.Height}, {src.Length} bytes)");
         }
         finally { Directory.Delete(dir, recursive: true); }
     }

@@ -268,9 +268,10 @@ internal static class TextureReport
         }
     }
 
-    static void InspectBundle(
+    internal static void InspectBundle(
         string path, string relative, bool scanPayloads, string classDataPath,
-        ConcurrentBag<TextureEntry> entries, ConcurrentDictionary<string, int> others)
+        ConcurrentBag<TextureEntry> entries, ConcurrentDictionary<string, int> others,
+        Dictionary<(string, long), byte[]>? capture = null)
     {
         var manager = new AssetsManager();
         manager.LoadClassPackage(classDataPath);
@@ -289,7 +290,7 @@ internal static class TextureReport
                     var bf = manager.GetBaseField(afile, asset);
                     if (bf == null) continue;
                     var entry = Describe(bf, relative, "bundle", dirInfo.Name, asset.PathId);
-                    ResolvePayload(entry, bf, scanPayloads, streamPath =>
+                    var payload = ResolvePayload(entry, bf, scanPayloads, streamPath =>
                     {
                         // "archive:/CAB-xxxx/CAB-xxxx.resS": the resource file is a
                         // sibling entry of the bundle, addressed by its last segment.
@@ -303,6 +304,7 @@ internal static class TextureReport
                             return reader.ReadBytes(checked((int)size));
                         });
                     });
+                    if (capture != null && payload != null) capture[(entry.AssetFile, entry.PathId)] = payload;
                     entries.Add(entry);
                 }
             }
@@ -310,9 +312,10 @@ internal static class TextureReport
         finally { manager.UnloadAll(); }
     }
 
-    static void InspectSerialized(
+    internal static void InspectSerialized(
         string path, string relative, bool scanPayloads, string classDataPath,
-        ConcurrentBag<TextureEntry> entries, ConcurrentDictionary<string, int> others)
+        ConcurrentBag<TextureEntry> entries, ConcurrentDictionary<string, int> others,
+        Dictionary<(string, long), byte[]>? capture = null)
     {
         var manager = new AssetsManager();
         manager.LoadClassPackage(classDataPath);
@@ -327,7 +330,7 @@ internal static class TextureReport
                 var bf = manager.GetBaseField(afile, asset);
                 if (bf == null) continue;
                 var entry = Describe(bf, relative, "serialized", Path.GetFileName(path), asset.PathId);
-                ResolvePayload(entry, bf, scanPayloads, streamPath =>
+                var payload = ResolvePayload(entry, bf, scanPayloads, streamPath =>
                 {
                     // A plain player file names its .resS relative to itself.
                     string candidate = Path.Combine(directory, streamPath.Replace('/', Path.DirectorySeparatorChar));
@@ -348,6 +351,7 @@ internal static class TextureReport
                         return bytes;
                     });
                 });
+                if (capture != null && payload != null) capture[(entry.AssetFile, entry.PathId)] = payload;
                 entries.Add(entry);
             }
         }
@@ -427,7 +431,7 @@ internal static class TextureReport
     /// saving. Reads the payload when asked, through <paramref name="locate"/>
     /// for streamed data.
     /// </summary>
-    internal static void ResolvePayload(
+    internal static byte[]? ResolvePayload(
         TextureEntry entry, AssetTypeValueField? bf, bool scanPayloads, Func<string, PayloadSource?> locate)
     {
         var format = TextureFormats.Describe(entry.FormatId);
@@ -511,6 +515,7 @@ internal static class TextureReport
             long native = TextureFormats.ChainSize(TextureFormats.Decoded(format), entry.Width, entry.Height, entry.MipCount);
             if (native >= 0) entry.BlockedSavingBytes = Math.Max(0, entry.AndroidResidentBytes - native * images);
         }
+        return payload;
     }
 
     /// <summary>Pure: totals and groupings from entries alone.</summary>

@@ -219,6 +219,7 @@ case "$MODE" in
         )
         [[ -z "${PC_BUILD_JOBS:-}" ]] || pc_args+=(--jobs "$PC_BUILD_JOBS")
         pc_args+=(--graphics-api "${PC_GRAPHICS_API:-vulkan}")
+        pc_args+=(--texture-format "${PC_TEXTURE_FORMAT:-native}")
         python3 tools/pc-builder/build.py "${pc_args[@]}"
         ;;
     texture-report)

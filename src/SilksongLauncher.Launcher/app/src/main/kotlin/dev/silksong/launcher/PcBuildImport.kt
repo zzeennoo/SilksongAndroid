@@ -21,12 +21,26 @@ import java.util.zip.ZipFile
 object PcBuildImport {
 
     private const val FORMAT = "1"
-    private const val PC_BUILD_CONTRACT = "android-graphics-backend-v1"
+    // v1 bundles predate the texture field and are all native-texture
+    // builds; v2 adds textureFormat and the optional texture patch pack.
+    // Both are accepted, so a ZIP built before this change still imports.
+    private const val PC_BUILD_CONTRACT_V1 = "android-graphics-backend-v1"
+    private const val PC_BUILD_CONTRACT_V2 = "android-texture-format-v2"
     private const val MANIFEST = "manifest.properties"
-    private const val MAX_BUNDLE_BYTES = 3_000L * 1024L * 1024L
+    // A texture pack carries every DXT atlas of the depot re-encoded, which
+    // can be several gigabytes; the ZIP limit has to hold that as well as
+    // the engine.
+    private const val MAX_BUNDLE_BYTES = 8_000L * 1024L * 1024L
     const val GRAPHICS_VULKAN = "vulkan"
     const val GRAPHICS_GLES3 = "gles3"
+    const val TEXTURES_NATIVE = "native"
+    const val TEXTURES_ETC2 = "etc2"
     private const val GLES_PATCHES = "gles-shaders.zip"
+    private const val TEXTURE_PATCHES = "texture-patches.zip"
+    // Must match TextureTranscode.Contract in bundle-surgery, which is what
+    // applies the pack; a pack from another revision is refused here rather
+    // than by the retarget half an hour in.
+    const val TEXTURE_PATCH_CONTRACT = "dxt-to-etc2-same-size-v1/silksong-etc2-1"
     private val DIGEST = Regex("[0-9a-f]{64}")
 
     private data class Payload(
@@ -42,13 +56,64 @@ object PcBuildImport {
         Payload("classes.jar", 20L * 1024L * 1024L),
     )
     private val glesPayload = Payload(GLES_PATCHES, 2_000L * 1024L * 1024L)
+    private val texturePayload = Payload(TEXTURE_PATCHES, 6_000L * 1024L * 1024L)
+
+    /** What the manifest says about textures; [Manifest.parse] is the pure part, for tests. */
+    data class TextureProfile(
+        val format: String,
+        val convertedCount: Int,
+        val encoder: String,
+        val manifestSha256: String,
+    ) {
+        val isEtc2 get() = format == TEXTURES_ETC2
+        val summary get() = if (isEtc2) "etc2 ($convertedCount converted, $encoder)" else "native"
+    }
 
     data class Staged(
         val directory: File,
         val createdUtc: String,
         val runtimeDigest: String,
         val graphicsApi: String,
+        val textures: TextureProfile = TextureProfile(TEXTURES_NATIVE, 0, "", ""),
     )
+
+    /** The manifest fields this importer reads, validated without any file access. */
+    internal object Manifest {
+        fun graphicsApi(properties: Properties): String {
+            val contract = properties.getProperty("pcBuildContract")
+            if (contract != PC_BUILD_CONTRACT_V1 && contract != PC_BUILD_CONTRACT_V2) {
+                throw IOException(
+                    "This PC build predates the selectable graphics backend. " +
+                        "Run Build-On-Windows again and import the new ZIP.",
+                )
+            }
+            val graphicsApi = properties.getProperty("graphicsApi").orEmpty()
+            if (graphicsApi != GRAPHICS_VULKAN && graphicsApi != GRAPHICS_GLES3) {
+                throw IOException("This PC build has an unsupported graphics backend")
+            }
+            return graphicsApi
+        }
+
+        fun textures(properties: Properties): TextureProfile {
+            val format = properties.getProperty("textureFormat", TEXTURES_NATIVE)
+            if (format == TEXTURES_NATIVE) return TextureProfile(TEXTURES_NATIVE, 0, "", "")
+            if (format != TEXTURES_ETC2) throw IOException("This PC build has an unsupported texture format: $format")
+            if (properties.getProperty("pcBuildContract") != PC_BUILD_CONTRACT_V2) {
+                throw IOException("This PC build declares ETC2 textures without the contract that carries them")
+            }
+            if (properties.getProperty("texturePatchContract") != TEXTURE_PATCH_CONTRACT) {
+                throw IOException(
+                    "This PC build's texture pack was made by a different converter " +
+                        "(${properties.getProperty("texturePatchContract")}); rebuild it with this APK's checkout",
+                )
+            }
+            val digest = properties.getProperty("textureManifestSha256").orEmpty()
+            if (!DIGEST.matches(digest)) throw IOException("This PC build has no valid texture manifest digest")
+            val count = properties.getProperty("textureConvertedCount")?.toIntOrNull()
+                ?: throw IOException("This PC build has no texture count")
+            return TextureProfile(TEXTURES_ETC2, count, properties.getProperty("textureEncoder").orEmpty(), digest)
+        }
+    }
 
     /** The exact game inputs from which IL2CPP output was generated. */
     fun depotFingerprint(depot: File): String {
@@ -136,7 +201,10 @@ object PcBuildImport {
                     ByteArrayInputStream(manifestBytes).use { load(BufferedInputStream(it)) }
                 }
                 val graphicsApi = validateManifest(context, properties, depot, launcherSignature)
-                val payloads = basePayloads + if (graphicsApi == GRAPHICS_GLES3) listOf(glesPayload) else emptyList()
+                val textures = Manifest.textures(properties)
+                val payloads = basePayloads +
+                    (if (graphicsApi == GRAPHICS_GLES3) listOf(glesPayload) else emptyList()) +
+                    (if (textures.isEtc2) listOf(texturePayload) else emptyList())
 
                 for ((index, payload) in payloads.withIndex()) {
                     onProgress("Checking ${payload.name} (${index + 1} of ${payloads.size})")
@@ -175,12 +243,13 @@ object PcBuildImport {
                     val actual = digest.digest().joinToString("") { "%02x".format(it) }
                     if (actual != expected) throw IOException("${payload.name} failed its SHA-256 check")
                 }
-                validatePayloads(staged, graphicsApi)
+                validatePayloads(staged, graphicsApi, textures)
                 return Staged(
                     staged,
                     properties.getProperty("createdUtc").orEmpty(),
                     properties.getProperty("libil2cpp.so.sha256").orEmpty(),
                     graphicsApi,
+                    textures,
                 )
             }
         } catch (t: Throwable) {
@@ -251,16 +320,7 @@ object PcBuildImport {
         if (properties.getProperty("unityVersion") != UnityFetcher.UNITY_VERSION) {
             throw IOException("This PC build targets a different Unity version")
         }
-        if (properties.getProperty("pcBuildContract") != PC_BUILD_CONTRACT) {
-            throw IOException(
-                "This PC build predates the selectable graphics backend. " +
-                    "Run Build-On-Windows again and import the new ZIP.",
-            )
-        }
-        val graphicsApi = properties.getProperty("graphicsApi").orEmpty()
-        if (graphicsApi != GRAPHICS_VULKAN && graphicsApi != GRAPHICS_GLES3) {
-            throw IOException("This PC build has an unsupported graphics backend")
-        }
+        val graphicsApi = Manifest.graphicsApi(properties)
         if (properties.getProperty("launcherSignature") != launcherSignature) {
             throw IOException("The APK and PC build do not match. Install the APK produced beside this ZIP.")
         }
@@ -271,7 +331,7 @@ object PcBuildImport {
         return graphicsApi
     }
 
-    private fun validatePayloads(staged: File, graphicsApi: String) {
+    private fun validatePayloads(staged: File, graphicsApi: String, textures: TextureProfile) {
         for (name in listOf("libil2cpp.so", "libunity.so", "libmain.so")) {
             val file = File(staged, name)
             val magic = file.inputStream().use { input ->
@@ -306,6 +366,18 @@ object PcBuildImport {
                 }
             }
         }
+        if (textures.isEtc2) {
+            // The manifest inside the pack is what the retarget trusts; its
+            // digest was signed with the ZIP, so prove the copy here is that one.
+            ZipFile(File(staged, TEXTURE_PATCHES)).use { zip ->
+                val entry = zip.getEntry("manifest.json")
+                    ?: throw IOException("$TEXTURE_PATCHES has no texture patch manifest")
+                val bytes = zip.getInputStream(entry).use { it.readBytes() }
+                if (digest(bytes) != textures.manifestSha256) {
+                    throw IOException("$TEXTURE_PATCHES carries a manifest the PC build did not sign")
+                }
+            }
+        }
     }
 
     /** Installs an already-verified set. Readiness is written separately, last. */
@@ -326,6 +398,12 @@ object PcBuildImport {
         } else {
             installedGlesPatches.delete()
         }
+        val installedTexturePatches = texturePatch(pkgDir)
+        if (staged.textures.isEtc2) {
+            copyAtomic(File(staged.directory, TEXTURE_PATCHES), installedTexturePatches)
+        } else {
+            installedTexturePatches.delete()
+        }
         // The digest validated while reading the signed ZIP is not enough for
         // the identity log: prove the file in the executable private runtime
         // directory is still that exact payload after the atomic copy.
@@ -341,16 +419,20 @@ object PcBuildImport {
         BuildInstallation.writeAtomic(
             File(pkgDir, ".pc-build.identity"),
             "createdUtc=${staged.createdUtc}\nlibil2cppSha256=$installedDigest\n" +
-                "graphicsApi=${staged.graphicsApi}\n",
+                "graphicsApi=${staged.graphicsApi}\ntextureFormat=${staged.textures.format}\n" +
+                "textureManifestSha256=${staged.textures.manifestSha256}\n",
         )
         staged.directory.deleteRecursively()
         LauncherLog.log(
             "PC build installed: created=${staged.createdUtc.ifEmpty { "unknown" }}, " +
-                "graphics=${staged.graphicsApi}, libil2cpp=$installedDigest",
+                "graphics=${staged.graphicsApi}, textures=${staged.textures.summary}, libil2cpp=$installedDigest",
         )
     }
 
     fun glesPatch(pkgDir: File): File = File(pkgDir, GLES_PATCHES)
+
+    /** The installed texture patch pack; absent for a native-texture build. */
+    fun texturePatch(pkgDir: File): File = File(pkgDir, TEXTURE_PATCHES)
 
     private fun copyAtomic(from: File, to: File, executable: Boolean = false) {
         to.parentFile?.mkdirs()
