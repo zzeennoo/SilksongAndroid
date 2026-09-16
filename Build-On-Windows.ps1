@@ -14,7 +14,17 @@ param(
     [string]$GraphicsApi = "Vulkan",
 
     [Parameter(Mandatory = $false)]
-    [switch]$ValidatePathsOnly
+    [switch]$ValidatePathsOnly,
+
+    # Write pc-output\texture-report.json for the depot and stop. Builds
+    # nothing and writes nothing into the depot; see tools/pc-builder/README.md.
+    [Parameter(Mandatory = $false)]
+    [switch]$TextureReport,
+
+    # With -TextureReport: skip reading texture payloads (faster, but cannot
+    # tell which DXT1 textures use one-bit transparency).
+    [Parameter(Mandatory = $false)]
+    [switch]$SkipPayloadScan
 )
 
 $ErrorActionPreference = "Stop"
@@ -61,13 +71,19 @@ $OutputPath = [System.IO.Path]::GetFullPath($Output)
 Write-Host "Silksong Android PC builder" -ForegroundColor Cyan
 Write-Host "  Linux depot: $DepotPath"
 Write-Host "  Output:      $OutputPath"
-Write-Host "  Graphics:    $GraphicsApi"
-if ($Jobs -gt 0) { Write-Host "  Jobs:        $Jobs" }
-else { Write-Host "  Jobs:        automatic (memory-safe)" }
+if ($TextureReport) {
+    Write-Host "  Mode:        texture report only (read-only, no build)"
+} else {
+    Write-Host "  Graphics:    $GraphicsApi"
+    if ($Jobs -gt 0) { Write-Host "  Jobs:        $Jobs" }
+    else { Write-Host "  Jobs:        automatic (memory-safe)" }
+}
 Write-Host ""
-Write-Host "The first run downloads the Docker image, Android NDK, and pinned Unity tools."
-Write-Host "Later runs reuse all of them, including completed native object files."
-Write-Host ""
+if (-not $TextureReport) {
+    Write-Host "The first run downloads the Docker image, Android NDK, and pinned Unity tools."
+    Write-Host "Later runs reuse all of them, including completed native object files."
+    Write-Host ""
+}
 
 $Image = "silksong-pc-builder:latest"
 docker build --platform linux/amd64 --target pc --tag $Image --file `
@@ -88,6 +104,18 @@ $DockerArgs = @(
     "--volume", "silksong-signing:/root/.android",
     "--env", "GRADLE_DAEMON=0"
 )
+if ($TextureReport) {
+    if ($SkipPayloadScan) {
+        $DockerArgs += @("--env", "PC_SKIP_PAYLOAD_SCAN=1")
+    }
+    $DockerArgs += @($Image, "texture-report")
+    & docker @DockerArgs
+    if ($LASTEXITCODE -ne 0) { Stop-Build "the texture report failed. The last error above is the useful one." }
+    Write-Host ""
+    Write-Host "Texture report complete: $(Join-Path $OutputPath 'texture-report.json')" -ForegroundColor Green
+    Write-Host "The summary above is total depot capacity, not what one scene keeps loaded."
+    return
+}
 if ($GraphicsApi -eq "OpenGLES3") {
     $DockerArgs += @("--env", "PC_GRAPHICS_API=gles3")
 }

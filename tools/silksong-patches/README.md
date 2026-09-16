@@ -77,6 +77,7 @@ Android SDK and a JDK, but not a game depot or a running Unity player.
 | `ShaderWarmup` | prewarm shader variants to cut first-encounter hitches |
 | `InventoryTouchInput` | touch control for the game's own inventory |
 | `PerfOverlay`, `ProfilerTopMarkers` | on-device performance readouts |
+| `TextureFormatProbe` | logs which compressed texture formats the GPU samples, and two snapshots of loaded textures by format |
 | `InjectionProbe` | proves the assembly is live, and logs the settings it sees |
 | `Settings` | reads the launcher's settings file |
 | `dualscreen/` | the second screen — see `DUALSCREEN-V2.md` |

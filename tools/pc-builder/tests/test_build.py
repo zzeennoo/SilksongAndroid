@@ -595,6 +595,64 @@ class PcBuilderTests(unittest.TestCase):
             self.assertIn("patched PathInternal_GetIsCaseSensitive_mAAAA still calls FileStream", result.stderr)
             self.assertIn("FileStream__ctor_mBBBB", result.stderr)
 
+    def test_texture_report_argv_names_the_surgery_command(self):
+        argv = pc_builder.texture_report_argv(
+            Path("/w/BundleSurgery.dll"), Path("/game/Data"), Path("/out/texture-report.json"), True)
+        self.assertEqual(
+            ["dotnet", "/w/BundleSurgery.dll", "texture-report", "/game/Data", "/out/texture-report.json"],
+            [str(a) for a in argv])
+        argv = pc_builder.texture_report_argv(
+            Path("/w/BundleSurgery.dll"), Path("/game/Data"), Path("/out/texture-report.json"), False)
+        self.assertEqual("--skip-payload-scan", argv[-1])
+
+    def test_texture_report_mode_needs_no_build_arguments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "depot/Hollow Knight Silksong_Data"
+            (data / "Managed").mkdir(parents=True)
+            (data / "globalgamemanagers").write_bytes(b"g")
+            (data / "Managed/Assembly-CSharp.dll").write_bytes(b"a")
+            (root / "depot/UnityPlayer.so").write_bytes(b"u")
+            calls = []
+
+            def fake_run(argv, *, cwd=None, env=None):
+                calls.append([str(a) for a in argv])
+                Path(argv[4]).write_text("{}", encoding="utf-8")
+
+            original_run, original_argv = pc_builder.run, sys.argv
+            pc_builder.run = fake_run
+            sys.argv = [
+                "build.py", "--repo", str(REPO_ROOT), "--depot", str(root / "depot"),
+                "--output", str(root / "out"), "--texture-report", "--skip-payload-scan",
+            ]
+            try:
+                self.assertEqual(0, pc_builder.main())
+            finally:
+                pc_builder.run, sys.argv = original_run, original_argv
+            self.assertEqual(1, len(calls))
+            self.assertEqual("texture-report", calls[0][2])
+            self.assertEqual(str(data), calls[0][3])
+            self.assertTrue(calls[0][4].endswith("texture-report.json"))
+            self.assertEqual("--skip-payload-scan", calls[0][-1])
+            self.assertTrue((root / "out/texture-report.json").is_file())
+
+    def test_game_build_still_requires_its_arguments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / "depot/Hollow Knight Silksong_Data"
+            (data / "Managed").mkdir(parents=True)
+            (data / "globalgamemanagers").write_bytes(b"g")
+            (data / "Managed/Assembly-CSharp.dll").write_bytes(b"a")
+            (root / "depot/UnityPlayer.so").write_bytes(b"u")
+            original_argv = sys.argv
+            sys.argv = ["build.py", "--repo", str(REPO_ROOT), "--depot", str(root / "depot"), "--output", str(root / "out")]
+            try:
+                with self.assertRaises(SystemExit) as raised:
+                    pc_builder.main()
+            finally:
+                sys.argv = original_argv
+            self.assertNotEqual(0, raised.exception.code)
+
     def test_bundle_uses_the_importers_exact_entry_names(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

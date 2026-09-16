@@ -89,7 +89,8 @@ jobs:
             -v "$PWD:/workspace" \
             silksong-pc-builder:check -lc \
             'dotnet build -c Release tools/bundle-surgery/BundleSurgery.csproj --nologo -v quiet && \
-             dotnet tools/bundle-surgery/bin/Release/net8.0/BundleSurgery.dll self-test-gles3'
+             dotnet tools/bundle-surgery/bin/Release/net8.0/BundleSurgery.dll self-test-gles3 && \
+             dotnet run -c Release --project tools/bundle-surgery/tests/BundleSurgery.Tests.csproj'
 
       - name: Cache build inputs
         uses: actions/cache@v4
