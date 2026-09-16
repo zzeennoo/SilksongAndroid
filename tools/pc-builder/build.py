@@ -738,6 +738,33 @@ def build_gles_shader_patches(repo: Path, depot_data: Path, root: Path) -> Path:
     return output
 
 
+def texture_report(repo: Path, data: Path, output_dir: Path, scan_payloads: bool = True) -> Path:
+    """Read-only: every Texture2D in the depot, its format and what it costs on Android.
+
+    Runs bundle-surgery's texture-report over the depot's *_Data directory,
+    which holds both the top-level player files and the Addressables tree.
+    Nothing under the depot is written; the JSON lands beside the build
+    outputs so it can be attached to an issue. The figures are capacity
+    figures for everything the game ships, not what any one scene has
+    resident -- the runtime TextureFormatProbe answers that from the device.
+    """
+    surgery = repo / "tools/bundle-surgery/bin/Release/net8.0/BundleSurgery.dll"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report = output_dir / "texture-report.json"
+    run(texture_report_argv(surgery, data, report, scan_payloads))
+    if not report.is_file():
+        fail(f"texture-report produced no {report}")
+    return report
+
+
+def texture_report_argv(surgery: Path, data: Path, report: Path, scan_payloads: bool) -> list[str]:
+    """The exact command texture_report runs, for tests and for the log."""
+    argv = ["dotnet", str(surgery), "texture-report", str(data), str(report)]
+    if not scan_payloads:
+        argv.append("--skip-payload-scan")
+    return argv
+
+
 def write_bundle(
     output_dir: Path,
     version: str,
@@ -819,29 +846,52 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--depot", type=Path, required=True)
-    parser.add_argument("--unity", type=Path, required=True)
-    parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    # Everything below is what a game build needs and a texture report does
+    # not. They stay required for a build; the check is after parsing so the
+    # report mode can leave them out.
+    parser.add_argument("--unity", type=Path)
+    parser.add_argument("--cache", type=Path)
     parser.add_argument("--jobs", type=int, default=automatic_jobs())
-    parser.add_argument("--keystore", type=Path, required=True)
-    parser.add_argument("--storepass", required=True)
-    parser.add_argument("--keypass", required=True)
-    parser.add_argument("--key-alias", required=True)
+    parser.add_argument("--keystore", type=Path)
+    parser.add_argument("--storepass")
+    parser.add_argument("--keypass")
+    parser.add_argument("--key-alias")
     parser.add_argument("--graphics-api", choices=tuple(GRAPHICS_APIS), default="vulkan")
+    parser.add_argument(
+        "--texture-report", action="store_true",
+        help="only write <output>/texture-report.json for the depot; builds nothing",
+    )
+    parser.add_argument(
+        "--skip-payload-scan", action="store_true",
+        help="with --texture-report: do not read texture payloads (faster; no DXT1 alpha detection)",
+    )
     args = parser.parse_args()
     if args.jobs < 1 or args.jobs > 64:
         fail("--jobs must be between 1 and 64")
 
     repo = args.repo.resolve()
     depot = args.depot.resolve()
-    unity = args.unity.resolve()
-    root = args.cache.resolve() / "game-build"
-    root.mkdir(parents=True, exist_ok=True)
     data = find_depot_data(depot)
     if not any((data.parent / name).is_file() for name in ("UnityPlayer.so", "Hollow Knight Silksong")):
         fail(f"{data.parent} does not look like the Linux depot (UnityPlayer.so is missing)")
     if (data.parent / "UnityPlayer.dll").is_file():
         fail("the Windows depot cannot be ported; download Steam depot 1030303 for Linux")
+
+    if args.texture_report:
+        report = texture_report(repo, data, args.output.resolve(), scan_payloads=not args.skip_payload_scan)
+        note("texture report complete")
+        note(f"JSON: {report}")
+        note("These are capacity figures for the whole depot, not the textures resident in any scene.")
+        return 0
+
+    missing = [name for name in ("unity", "cache", "keystore", "storepass", "keypass", "key_alias")
+               if getattr(args, name) is None]
+    if missing:
+        parser.error("a game build needs --" + ", --".join(m.replace("_", "-") for m in missing))
+    unity = args.unity.resolve()
+    root = args.cache.resolve() / "game-build"
+    root.mkdir(parents=True, exist_ok=True)
 
     version = (repo / "VERSION").read_text(encoding="utf-8").strip()
     csc = ensure_roslyn(args.cache.resolve())

@@ -116,6 +116,9 @@ devices: ## List connected devices
 surgery: ## Build bundle-surgery (Gradle stages it into the APK)
 	dotnet build -c Release tools/bundle-surgery/BundleSurgery.csproj
 
+surgery-test: ## Run bundle-surgery's regression tests (texture formats, DXT, report)
+	dotnet run -c Release --project tools/bundle-surgery/tests/BundleSurgery.Tests.csproj
+
 weaver: ## Build mod-weaver (Gradle stages it into the APK)
 	dotnet build -c Release tools/mod-weaver/ModWeaver.csproj
 

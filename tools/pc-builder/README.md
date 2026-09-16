@@ -55,6 +55,39 @@ keeps the safer 30 fps cap. This is an experimental compatibility path, not a
 claim that GLES is normally faster than Vulkan or that every scene will hold
 60 fps.
 
+### Texture report (read-only)
+
+The Linux depot is a desktop build, so its textures are DXT1/DXT5 (and
+possibly BC7). No Mali or Adreno GPU samples those formats; the Android player
+expands each one to RGBA32 on the CPU at load time and uploads that -- four
+times the bytes of a DXT5 atlas, eight times a DXT1 one, held by the driver
+rather than in the process heap. Before anything converts textures, measure
+how much of the depot is in that position:
+
+```powershell
+.\Build-On-Windows.ps1 -Depot "D:\Games\Silksong-Linux" -TextureReport
+```
+
+(or drag the depot onto `Build-On-Windows.cmd` with `TextureReport` as the
+second argument). It needs only Docker and the depot: no Unity pieces are
+fetched and nothing is built. It writes `pc-output\texture-report.json` and
+prints a per-format summary: count, source bytes, what they cost on Android
+once expanded, what a same-size ETC2 swap would cost, and the difference. It
+also counts what a same-size swap could not handle yet (crunched formats,
+BC4/BC5/BC7, cubemaps, arrays, payloads whose size does not match their
+dimensions) and lists the largest textures.
+
+Two things the numbers are not. They are **capacity** figures for everything
+the game ships, not what the language-select screen has resident; the
+`TextureFormatProbe` patch logs the latter from the device, as
+`[TextureProbe]` lines in Unity's log, with `SystemInfo.SupportsTextureFormat`
+answers for DXT1/DXT5/BC7/ETC2/ASTC and two snapshots of loaded textures by
+format. And nothing is converted: the report opens the depot read-only.
+
+Add `-SkipPayloadScan` to skip reading texture bytes. That is faster on a
+slow disk but cannot tell which DXT1 textures use one-bit transparency (those
+would need `ETC2_RGBA1`, not `ETC2_RGB`), so it reports them as unscanned.
+
 The locally generated APK has one signing identity that is kept in Docker's
 `silksong-signing` volume. It can update later APKs made by this same PC, but
 it cannot update an APK signed by GitHub or another machine. Android reports
@@ -112,4 +145,7 @@ docker run --rm --platform linux/amd64 \
   -e PC_BUILD_JOBS=8 silksong-pc-builder:latest pc
 ```
 
-Add `-e PC_GRAPHICS_API=gles3` for the OpenGL ES build.
+Add `-e PC_GRAPHICS_API=gles3` for the OpenGL ES build. Replace the trailing
+`pc` with `texture-report` (optionally with `-e PC_SKIP_PAYLOAD_SCAN=1`) for
+the read-only texture report; only the `/workspace`, `/game` and `/pc-output`
+mounts matter to it.

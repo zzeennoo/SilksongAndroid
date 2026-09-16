@@ -221,6 +221,18 @@ case "$MODE" in
         pc_args+=(--graphics-api "${PC_GRAPHICS_API:-vulkan}")
         python3 tools/pc-builder/build.py "${pc_args[@]}"
         ;;
+    texture-report)
+        # Read-only inventory of the depot's textures: formats, payload sizes,
+        # what each costs once an Android GPU that cannot sample DXT expands
+        # it to RGBA32, and what a same-size ETC2 swap would save. Needs only
+        # the depot at /game and bundle-surgery, which is already built above;
+        # no Unity pieces, no APK, and nothing under /game is written.
+        mkdir -p /pc-output
+        say "writing the depot texture report"
+        report_args=(--repo /workspace --depot /game --output /pc-output --texture-report)
+        [[ "${PC_SKIP_PAYLOAD_SCAN:-0}" == 1 ]] && report_args+=(--skip-payload-scan)
+        python3 tools/pc-builder/build.py "${report_args[@]}"
+        ;;
     shell)
         exec bash
         ;;
