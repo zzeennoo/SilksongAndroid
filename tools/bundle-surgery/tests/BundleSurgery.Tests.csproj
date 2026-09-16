@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Regression tests for the parts of bundle-surgery that can be exercised
+    without a Unity file: texture format arithmetic, DXT block reading, and
+    the report's grouping. Run with
+
+        dotnet run -c Release &#45;&#45;project tools/bundle-surgery/tests/BundleSurgery.Tests.csproj
+
+    Set SILKSONG_TEXTURE_FIXTURE to any Unity serialized file or bundle to
+    also run the walker over it; the depot itself is never in the checkout.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <UseAppHost>false</UseAppHost>
+    <AssemblyName>BundleSurgery.Tests</AssemblyName>
+    <RootNamespace>BundleSurgery.Tests</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\BundleSurgery.csproj" />
+  </ItemGroup>
+</Project>

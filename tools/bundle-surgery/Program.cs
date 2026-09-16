@@ -1,4 +1,4 @@
-using AssetsTools.NET;
+﻿using AssetsTools.NET;
 using AssetsTools.NET.Extra;
 using System.Text;
 
@@ -66,6 +66,8 @@ internal static class Program
             Console.Error.WriteLine("  retarget-tree-gles <aa-root> <group> <progress> <patches.zip> — apply preconverted GLES blobs in place");
             Console.Error.WriteLine();
             Console.Error.WriteLine("inspection (diagnostic):");
+            Console.Error.WriteLine("  shader-report <bundle>                          — per-shader platform slices");
+            Console.Error.WriteLine("  texture-report <root> <out.json> [--skip-payload-scan] — every Texture2D under <root>: formats, payload sizes, RGBA32 fallback cost, ETC2 targets (read-only)");
             return 2;
         }
 
@@ -90,6 +92,8 @@ internal static class Program
             "audit-gles3-patches" when args.Length >= 2 => ShaderGles.AuditPatchArchive(args[1]),
             "self-test-gles3" => ShaderGles.SelfTest(),
             "shader-report" when args.Length >= 2 => ShaderReport(args[1]),
+            "texture-report" when args.Length >= 3 => TextureReport.Run(
+                args[1], args[2], scanPayloads: !args.Skip(3).Contains("--skip-payload-scan"), ClassDataPath),
             _ => Usage(),
         };
     }

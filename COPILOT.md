@@ -198,6 +198,12 @@ exercise the actual weaver without requiring game files:
 dotnet run --project .\tools\mod-weaver\tests\ModWeaver.RegressionTests.csproj --configuration Release
 ```
 
+bundle-surgery has its own regressions for the texture-format arithmetic, the
+DXT block reader and the `texture-report` grouping (`make surgery-test`, or
+`dotnet run --project tools/bundle-surgery/tests/BundleSurgery.Tests.csproj -c Release`).
+They need no game files; set `SILKSONG_TEXTURE_FIXTURE` to any serialized
+file or bundle to also exercise the walker.
+
 ### Check before you build
 
 ```sh

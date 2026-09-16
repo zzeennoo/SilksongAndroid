@@ -38,6 +38,7 @@
     { "className": "WormAnimatorFix", "methodName": "Bootstrap", "loadTypes": 2 },
     { "className": "ShaderWarmup", "methodName": "Bootstrap", "loadTypes": 0 },
     { "className": "ProfilerTopMarkers", "methodName": "Bootstrap", "loadTypes": 2 },
+    { "className": "TextureFormatProbe", "methodName": "Bootstrap", "loadTypes": 0 },
     { "className": "TrapProbe", "methodName": "Bootstrap", "loadTypes": 2 },
     { "className": "AndroidRumble", "methodName": "Bootstrap", "loadTypes": 0 },
     { "className": "InputProbe", "methodName": "Bootstrap", "loadTypes": 0 }
