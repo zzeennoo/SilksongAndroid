@@ -62,8 +62,11 @@ internal static class Program
             Console.Error.WriteLine("  redirect-file-replace <Assembly-CSharp.dll> <SilksongIo.dll> — point the game's File.Replace calls at SafeIo (fixes saving where ReplaceFile is unsupported)");
             Console.Error.WriteLine("  patch-system-io-case-sensitivity <assembly-dir> — replace every PathInternal case probe with its safe Android fallback");
             Console.Error.WriteLine("  audit-system-io <assembly-dir>                  — report launch-critical System.IO type owners");
-            Console.Error.WriteLine("  retarget-tree <src-dir> <dst-dir> [progress]    — extract-vulkan-android over a whole bundle tree, in parallel, resumable");
-            Console.Error.WriteLine("  retarget-tree-gles <aa-root> <group> <progress> <patches.zip> — apply preconverted GLES blobs in place");
+            Console.Error.WriteLine("  retarget-tree <src-dir> <dst-dir> [progress] [--textures <pack.zip> <data-root>] — extract-vulkan-android over a whole bundle tree, in parallel, resumable");
+            Console.Error.WriteLine("  retarget-tree-gles <aa-root> <group> <progress> <patches.zip> [--textures <pack.zip> <data-root>] — apply preconverted GLES blobs in place");
+            Console.Error.WriteLine("  build-texture-patches <data-root> <out.zip>      — PC: re-encode every convertible DXT1/DXT5 Texture2D as same-size ETC2 into a patch pack");
+            Console.Error.WriteLine("  audit-texture-patches <pack.zip>                 — verify a texture patch pack");
+            Console.Error.WriteLine("  apply-texture-patches <root> <pack.zip>          — apply a pack's serialized-file entries under <root> in place (the PC player image)");
             Console.Error.WriteLine();
             Console.Error.WriteLine("inspection (diagnostic):");
             Console.Error.WriteLine("  shader-report <bundle>                          — per-shader platform slices");
@@ -81,9 +84,13 @@ internal static class Program
             "patch-system-io-case-sensitivity" when args.Length >= 2 => PatchSystemIoCaseSensitivity.Run(args[1]),
             "audit-system-io" when args.Length >= 2 => SystemIoAudit.Run(args[1]),
             "retarget-tree" when args.Length >= 3 => RetargetTree(
-                args[1], args[2], args.Length >= 4 ? args[3] : null),
+                args[1], args[2], args.Length >= 4 && args[3] != "--textures" ? args[3] : null,
+                TexturePackOption(args, 3)),
             "retarget-tree-gles" when args.Length >= 5 => ShaderGles.RetargetTree(
-                args[1], args[2], args[3], args[4], ClassDataPath),
+                args[1], args[2], args[3], args[4], ClassDataPath, TexturePackOption(args, 5)),
+            "build-texture-patches" when args.Length >= 3 => TextureTranscode.BuildPack(args[1], args[2], ClassDataPath),
+            "audit-texture-patches" when args.Length >= 2 => TextureTranscode.Audit(args[1]),
+            "apply-texture-patches" when args.Length >= 3 => TextureTranscode.ApplyToSerialized(args[1], args[2], ClassDataPath),
             "extract-vulkan-android" when args.Length >= 3 => ExtractVulkanAndroid(args[1], args[2]),
             "extract-gles3-android" when args.Length >= 3 => ShaderGles.ExtractAndroid(
                 args[1], args[2], ClassDataPath),
@@ -96,6 +103,18 @@ internal static class Program
                 args[1], args[2], scanPayloads: !args.Skip(3).Contains("--skip-payload-scan"), ClassDataPath),
             _ => Usage(),
         };
+    }
+
+    /// <summary>
+    /// The optional `--textures <pack.zip> <data-root>` pair at or after
+    /// <paramref name="from"/>: a texture patch pack and the directory its
+    /// entries are relative to (the depot's *_Data directory).
+    /// </summary>
+    internal static (string pack, string root)? TexturePackOption(string[] args, int from)
+    {
+        for (int i = from; i + 2 < args.Length; i++)
+            if (args[i] == "--textures") return (args[i + 1], args[i + 2]);
+        return null;
     }
 
     // Retargets an entire bundle tree in one process.
@@ -112,10 +131,16 @@ internal static class Program
     // temporary file and moved into place, and existing outputs are skipped,
     // so an interrupted run resumes rather than restarting -- worth having for
     // a multi-gigabyte job.
-    static int RetargetTree(string srcRoot, string dstRoot, string? progressPath)
+    static int RetargetTree(string srcRoot, string dstRoot, string? progressPath, (string pack, string root)? textures = null)
     {
         srcRoot = Path.GetFullPath(srcRoot);
         dstRoot = Path.GetFullPath(dstRoot);
+        // Texture patches ride along: the pack is opened once, each bundle
+        // looks itself up by its path relative to the data root, and a
+        // bundle the pack does not mention is untouched by it.
+        using var texturePack = textures is { } t ? new TextureTranscode.Pack(t.pack) : null;
+        string? textureRoot = textures is { } tr ? Path.GetFullPath(tr.root) : null;
+        if (texturePack != null) Console.WriteLine($"  texture patches: {texturePack.Manifest.TextureCount} texture(s) in {texturePack.Manifest.FileCount} file(s)");
 
         // In-place is the normal mode on a phone, where there is no room for a
         // second copy of a multi-gigabyte content tree.
@@ -186,7 +211,8 @@ internal static class Program
                 {
                     // Each bundle gets its own AssetsManager: they hold per-file
                     // state and are not safe to share across threads.
-                    if (RetargetOne(input, output)) Interlocked.Increment(ref done);
+                    string? textureKey = textureRoot == null ? null : Path.GetRelativePath(textureRoot, input).Replace('\\', '/');
+                    if (RetargetOne(input, output, texturePack, textureKey)) Interlocked.Increment(ref done);
                     else Interlocked.Increment(ref skipped);
                 }
                 catch (Exception e)
@@ -218,7 +244,7 @@ internal static class Program
     //
     // Kept separate from ExtractVulkanAndroid so the batch path stays quiet:
     // printing a line per bundle across thousands of files is just noise.
-    static bool RetargetOne(string inputPath, string outputPath)
+    static bool RetargetOne(string inputPath, string outputPath, TextureTranscode.Pack? textures = null, string? textureKey = null)
     {
         const int ANDROID_BUILD_TARGET = 13;
 
@@ -228,6 +254,14 @@ internal static class Program
         var bundle = manager.LoadBundleFile(inputPath, true);
         manager.LoadClassDatabaseFromPackage(bundle.file.Header.EngineVersion);
         bool changedAnything = false;
+
+        // Textures first, so the same-size payload swap and the format
+        // change land in the same rewrite as the platform stamp below.
+        if (textures != null && textureKey != null &&
+            TextureTranscode.ApplyToBundle(textures, textureKey, bundle, manager) > 0)
+        {
+            changedAnything = true;
+        }
 
         foreach (var dirInfo in bundle.file.BlockAndDirInfo.DirectoryInfos)
         {
@@ -273,6 +307,10 @@ internal static class Program
         manager.UnloadAll();
         if (File.Exists(outputPath)) File.Delete(outputPath);
         File.Move(tempPath, outputPath);
+        // Read back: the written textures must carry the target format and
+        // the pack's bytes, or this bundle counts as failed.
+        if (textures != null && textureKey != null)
+            TextureTranscode.VerifyBundle(textures, textureKey, outputPath, ClassDataPath);
         return true;
     }
 

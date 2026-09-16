@@ -71,6 +71,16 @@ A copy of the Apache License 2.0 is at
   Castle Inc. The Bouncy Castle Licence is an adaptation of the MIT licence;
   see <https://www.bouncycastle.org/licence.html>.
 
+## A note on the ETC2 encoder
+
+`tools/bundle-surgery/Etc2.cs` is this project's own encoder and decoder for
+ETC2 (RGB, RGB with punch-through alpha, and RGBA8 with EAC alpha), MIT like
+the rest of the repository. It is written from the Khronos OpenGL ES 3.0
+specification, appendix C, whose block layouts and modifier tables it
+reproduces; no code from any other encoder is included. It is used only on
+the PC, to re-encode a depot's DXT textures into same-size ETC2 patches; the
+device applies those bytes and never runs the codec.
+
 ## A note on `classdata.tpk`
 
 `assets/ondevice/bundle-surgery/classdata.tpk` is a type-package database that

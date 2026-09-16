@@ -94,6 +94,8 @@ everyone who installed the last one. See the comments in
 The normal path builds the game on the phone. `make dev` only ships the app
 that does the building. A Windows/Docker path also exists for constrained
 devices; `Build-On-Windows.ps1` produces a matching APK and private import ZIP.
+`-TextureReport` inventories the depot's textures without building, and
+`-TextureFormat ETC2` re-encodes its DXT textures as same-size ETC2 (opt-in).
 See `tools/pc-builder/README.md`.
 
 To make an on-device installation build the game again:

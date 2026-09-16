@@ -653,6 +653,105 @@ class PcBuilderTests(unittest.TestCase):
                 sys.argv = original_argv
             self.assertNotEqual(0, raised.exception.code)
 
+    def _fake_texture_pack(self, root: Path, contract: str | None = None) -> Path:
+        manifest = {
+            "format": 1, "contract": contract or pc_builder.TEXTURE_PATCH_CONTRACT, "encoder": "silksong-etc2-1",
+            "targetFamily": "etc2", "fileCount": 1, "textureCount": 3, "sourceBytes": 1000,
+            "androidResidentBytes": 4000, "etc2Bytes": 1000,
+            "sourceFormats": {"DXT5 (BC3)": 2, "DXT1 (BC1)": 1}, "targetFormats": {"ETC2_RGBA8": 2, "ETC2_RGB": 1},
+            "skipped": {"crunched": 4}, "files": {"aa/x.bundle": []},
+        }
+        pack = root / "texture-patches.zip"
+        with zipfile.ZipFile(pack, "w") as archive:
+            archive.writestr("manifest.json", json.dumps(manifest))
+        return pack
+
+    def test_texture_patch_contract_matches_bundle_surgery_and_the_importer(self):
+        surgery = (REPO_ROOT / "tools/bundle-surgery/TextureTranscode.cs").read_text(encoding="utf-8")
+        etc2 = (REPO_ROOT / "tools/bundle-surgery/Etc2.cs").read_text(encoding="utf-8")
+        importer = (REPO_ROOT / "src/SilksongLauncher.Launcher/app/src/main/kotlin/dev/silksong/launcher/PcBuildImport.kt").read_text(encoding="utf-8")
+        rule = re.search(r'Contract = "([^"]+)/" \+ Etc2\.EncoderVersion', surgery).group(1)
+        encoder = re.search(r'EncoderVersion = "([^"]+)"', etc2).group(1)
+        self.assertEqual(f"{rule}/{encoder}", pc_builder.TEXTURE_PATCH_CONTRACT)
+        self.assertIn(f'TEXTURE_PATCH_CONTRACT = "{pc_builder.TEXTURE_PATCH_CONTRACT}"', importer)
+        self.assertIn(f'PC_BUILD_CONTRACT_V2 = "{pc_builder.PC_BUILD_CONTRACT}"', importer)
+
+    def test_texture_patch_summary_reads_the_pack_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pack = self._fake_texture_pack(Path(tmp))
+            fields = pc_builder.texture_patch_summary(pack)
+            self.assertEqual("etc2", fields["textureFormat"])
+            self.assertEqual("3", fields["textureConvertedCount"])
+            self.assertEqual("DXT1 (BC1):1,DXT5 (BC3):2", fields["textureSourceFormats"])
+            self.assertEqual("crunched:4", fields["textureSkipped"])
+            self.assertEqual("4000", fields["textureRgba32FallbackBytes"])
+            self.assertEqual("1000", fields["textureEtc2Bytes"])
+            self.assertEqual("3000", fields["textureTheoreticalSavingBytes"])
+            with zipfile.ZipFile(pack) as archive:
+                expected = hashlib.sha256(archive.read("manifest.json")).hexdigest()
+            self.assertEqual(expected, fields["textureManifestSha256"])
+            stale = self._fake_texture_pack(Path(tmp) / "stale", contract="dxt-to-etc2-same-size-v0/x") if (Path(tmp) / "stale").mkdir() is None else None
+            with self.assertRaises(SystemExit):
+                pc_builder.texture_patch_summary(stale)
+
+    def test_etc2_bundle_names_textures_and_records_the_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payloads = {}
+            for name in ("libil2cpp.so", "libunity.so", "libmain.so", "data.apk", "classes.jar"):
+                path = root / name
+                path.write_bytes((name + "\n").encode())
+                payloads[name] = path
+            pack = self._fake_texture_pack(root)
+            payloads["texture-patches.zip"] = pack
+            fields = pc_builder.texture_patch_summary(pack)
+            bundle = pc_builder.write_bundle(root / "out", "1.2.3", "2|signature", "a" * 64, payloads, "vulkan", fields)
+            self.assertEqual("SilksongAndroid-1.2.3-ETC2-PC-Build.zip", bundle.name)
+            gles = pc_builder.write_bundle(root / "out2", "1.2.3", "2|signature", "a" * 64, payloads, "gles3", fields)
+            self.assertEqual("SilksongAndroid-1.2.3-OpenGLES3-ETC2-PC-Build.zip", gles.name)
+            with zipfile.ZipFile(bundle) as archive:
+                manifest = archive.read("manifest.properties").decode("ascii")
+                self.assertIn(f"pcBuildContract={pc_builder.PC_BUILD_CONTRACT}\n", manifest)
+                self.assertIn("textureFormat=etc2\n", manifest)
+                self.assertIn(f"texturePatchContract={pc_builder.TEXTURE_PATCH_CONTRACT}\n", manifest)
+                self.assertIn("textureConvertedCount=3\n", manifest)
+                self.assertIn(f"textureManifestSha256={fields['textureManifestSha256']}\n", manifest)
+                self.assertIn("texture_patches.zip.sha256=", manifest)
+                self.assertIn("payload/texture-patches.zip", archive.namelist())
+            pc_builder.verify_bundle_payloads(bundle, payloads)
+            # Native builds say so and carry no pack.
+            del payloads["texture-patches.zip"]
+            native = pc_builder.write_bundle(root / "out3", "1.2.3", "2|signature", "a" * 64, payloads)
+            self.assertEqual("SilksongAndroid-1.2.3-PC-Build.zip", native.name)
+            with zipfile.ZipFile(native) as archive:
+                self.assertIn("textureFormat=native\n", archive.read("manifest.properties").decode("ascii"))
+            # An ETC2 build without its pack is refused.
+            with self.assertRaises(SystemExit):
+                pc_builder.write_bundle(root / "out4", "1.2.3", "2|signature", "a" * 64, payloads, "vulkan", fields)
+
+    def test_texture_patch_fingerprint_follows_the_depot_and_the_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            (data / "StreamingAssets/aa").mkdir(parents=True)
+            (data / "StreamingAssets/aa/x.bundle").write_bytes(b"x")
+            (data / "resources.assets").write_bytes(b"r")
+            (data / "resources.assets.resS").write_bytes(b"s")
+            before = pc_builder.texture_patch_fingerprint(data)
+            self.assertEqual(before, pc_builder.texture_patch_fingerprint(data))
+            (data / "resources.assets.resS").write_bytes(b"ss")
+            self.assertNotEqual(before, pc_builder.texture_patch_fingerprint(data))
+            self.assertIn(pc_builder.TEXTURE_PATCH_CONTRACT, pc_builder.TEXTURE_PATCH_CONTRACT)
+
+    def test_entrypoint_and_wrapper_propagate_the_texture_format(self):
+        entrypoint = (REPO_ROOT / "tools/docker/apk-entrypoint.sh").read_text(encoding="utf-8")
+        self.assertIn('--texture-format "${PC_TEXTURE_FORMAT:-native}"', entrypoint)
+        wrapper = (REPO_ROOT / "Build-On-Windows.ps1").read_text(encoding="utf-8")
+        self.assertIn('[ValidateSet("Native", "ETC2")]', wrapper)
+        self.assertIn('PC_TEXTURE_FORMAT=etc2', wrapper)
+        cmd = (REPO_ROOT / "Build-On-Windows.cmd").read_text(encoding="utf-8")
+        self.assertIn('-TextureFormat %TEX%', cmd)
+        self.assertIn('set "TEX=ETC2"', cmd)
+
     def test_bundle_uses_the_importers_exact_entry_names(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

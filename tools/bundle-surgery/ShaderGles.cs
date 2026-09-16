@@ -885,7 +885,8 @@ internal static class ShaderGles
         string groupRoot,
         string progressPath,
         string patchPath,
-        string classDataPath)
+        string classDataPath,
+        (string pack, string root)? textures = null)
     {
         aaRoot = Path.GetFullPath(aaRoot);
         groupRoot = Path.GetFullPath(groupRoot);
@@ -893,6 +894,9 @@ internal static class ShaderGles
         if (inputs.Length == 0) throw new InvalidDataException($"no bundles under {groupRoot}");
 
         using var archive = new PatchArchive(patchPath);
+        // Texture patches ride along with the shader ones; see Program.RetargetTree.
+        using var texturePack = textures is { } t ? new TextureTranscode.Pack(t.pack) : null;
+        string? textureRoot = textures is { } tr ? Path.GetFullPath(tr.root) : null;
         int processed = 0, changed = 0, skipped = 0, failed = 0;
         var errors = new ConcurrentBag<string>();
         var progressLock = new object();
@@ -924,7 +928,8 @@ internal static class ShaderGles
                 {
                     if (!archive.Manifest.Bundles.TryGetValue(relative, out var patches))
                         throw new InvalidDataException($"GLES patch archive has no record for {relative}");
-                    ApplyBundle(input, patches, archive, classDataPath);
+                    string? textureKey = textureRoot == null ? null : Path.GetRelativePath(textureRoot, input).Replace('\\', '/');
+                    ApplyBundle(input, patches, archive, classDataPath, texturePack, textureKey);
                     Interlocked.Increment(ref changed);
                 }
                 catch (Exception e)
@@ -943,7 +948,9 @@ internal static class ShaderGles
         return failed == 0 ? 0 : 1;
     }
 
-    private static void ApplyBundle(string path, List<ShaderPatch> patches, PatchArchive archive, string classDataPath)
+    private static void ApplyBundle(
+        string path, List<ShaderPatch> patches, PatchArchive archive, string classDataPath,
+        TextureTranscode.Pack? textures = null, string? textureKey = null)
     {
         var manager = new AssetsManager();
         manager.LoadClassPackage(classDataPath);
@@ -953,6 +960,8 @@ internal static class ShaderGles
         int found = 0;
         try
         {
+            if (textures != null && textureKey != null)
+                TextureTranscode.ApplyToBundle(textures, textureKey, bundle, manager);
             foreach (var dirInfo in bundle.file.BlockAndDirInfo.DirectoryInfos)
             {
                 if ((dirInfo.Flags & 4) == 0) continue;
@@ -991,6 +1000,8 @@ internal static class ShaderGles
             manager.UnloadAll();
             File.Delete(path);
             File.Move(temp, path);
+            if (textures != null && textureKey != null)
+                TextureTranscode.VerifyBundle(textures, textureKey, path, classDataPath);
         }
         finally { manager.UnloadAll(); }
     }

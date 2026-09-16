@@ -68,8 +68,10 @@ profile (720×540 on the AYANEO's 4:3 screen):
 ```
 
 `-TextureReport` writes a read-only inventory of the depot's texture formats
-and what they cost on an Android GPU, without building anything; see the
-[PC builder guide](tools/pc-builder/README.md#texture-report-read-only).
+and what they cost on an Android GPU, without building anything, and
+`-TextureFormat ETC2` re-encodes the depot's DXT textures as same-size ETC2 on
+the PC so the device no longer expands them to RGBA32; see the
+[PC builder guide](tools/pc-builder/README.md#etc2-textures-opt-in).
 
 The content rewrite keeps only the selected shader backend. You can move from
 an already-retargeted Vulkan tree to OpenGL ES because the PC bundle supplies

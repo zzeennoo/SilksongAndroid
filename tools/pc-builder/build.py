@@ -23,7 +23,10 @@ from pathlib import Path
 
 UNITY_VERSION = "6000.0.50f1"
 PACKAGE = "com.jakobkhansen.silksong"
-PC_BUILD_CONTRACT = "android-graphics-backend-v1"
+# Bumped when the manifest gains a field the importer must understand. v2
+# adds textureFormat and the optional texture patch pack; an importer that
+# knows v2 still accepts v1 bundles (which are all native-texture builds).
+PC_BUILD_CONTRACT = "android-texture-format-v2"
 # The staged unityaot assemblies are now patched before conversion, so their
 # digest already invalidates an older C++ tree. Keep a named contract as well:
 # it makes the reason explicit and prevents a coincidental input hash match
@@ -32,6 +35,10 @@ CONVERSION_CACHE_CONTRACT = "android-system-io-fallback-v1"
 CONTENT_ROOT = f"/data/user/0/{PACKAGE}/files/aa"
 GRAPHICS_APIS = {"vulkan": "21", "gles3": "11"}
 GLES_PATCH_CONTRACT = "spirv-cross-be71ee8-essl310-v1"
+TEXTURE_FORMATS = ("native", "etc2")
+# Must match TextureTranscode.Contract in bundle-surgery: the same-size
+# DXT -> ETC2 rule and the encoder revision that produced the bytes.
+TEXTURE_PATCH_CONTRACT = "dxt-to-etc2-same-size-v1/silksong-etc2-1"
 ROSLYN_VERSION = "4.12.0"
 ROSLYN_BYTES = 21_775_071
 ROSLYN_FILES = (
@@ -595,6 +602,7 @@ def build_player_image(
     converted: Path,
     asm: Path,
     graphics_api: str = "vulkan",
+    texture_patches: Path | None = None,
 ) -> Path:
     surgery = repo / "tools/bundle-surgery/bin/Release/net8.0/BundleSurgery.dll"
     image = root / "image"
@@ -644,6 +652,13 @@ def build_player_image(
         path = image / "Resources/unity_builtin_extra"
         run(["dotnet", str(surgery), "set-unity-version", str(path), UNITY_VERSION])
         retarget_serialized(path)
+
+    # The player image's own serialized files (resources.assets and friends)
+    # carry textures too. Their patches are applied here, on the PC's staged
+    # copies, so the device never touches them; the Addressables bundles'
+    # patches travel in the same pack and are applied by the device retarget.
+    if texture_patches is not None:
+        run(["dotnet", str(surgery), "apply-texture-patches", str(image), str(texture_patches)])
 
     ggm = image / "globalgamemanagers"
     run(["dotnet", str(surgery), "set-graphics-apis", str(ggm), GRAPHICS_APIS[graphics_api]])
@@ -738,6 +753,65 @@ def build_gles_shader_patches(repo: Path, depot_data: Path, root: Path) -> Path:
     return output
 
 
+def texture_patch_fingerprint(data: Path) -> str:
+    """Cache identity for the texture walk: every bundle and serialized file, by stat, plus the contract."""
+    digest = hashlib.sha256()
+    digest.update(TEXTURE_PATCH_CONTRACT.encode("ascii"))
+    digest.update(b"\0")
+    files = [p for p in data.rglob("*") if p.is_file() and (p.suffix == ".bundle" or p.suffix == ".assets" or p.suffix == "" or p.suffix == ".resS")]
+    for path in sorted(files, key=lambda p: p.relative_to(data).as_posix()):
+        stat = path.stat()
+        digest.update(path.relative_to(data).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(stat.st_size).encode("ascii"))
+        digest.update(b"/")
+        digest.update(str(stat.st_mtime_ns).encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def build_texture_patches(repo: Path, depot_data: Path, root: Path) -> Path:
+    """Re-encode every convertible DXT texture as same-size ETC2 into a patch pack, cached by depot identity."""
+    surgery = repo / "tools/bundle-surgery/bin/Release/net8.0/BundleSurgery.dll"
+    output = root / "texture-patches.zip"
+    receipt = root / "texture-patches.fingerprint"
+    expected = texture_patch_fingerprint(depot_data)
+    if output.is_file() and receipt.is_file() and receipt.read_text(encoding="ascii").strip() == expected:
+        note("reusing verified ETC2 texture patches")
+        run(["dotnet", str(surgery), "audit-texture-patches", str(output)])
+        return output
+    output.unlink(missing_ok=True)
+    receipt.unlink(missing_ok=True)
+    note("re-encoding DXT textures as same-size ETC2 (this walks the whole depot)")
+    run(["dotnet", str(surgery), "build-texture-patches", str(depot_data), str(output)])
+    run(["dotnet", str(surgery), "audit-texture-patches", str(output)])
+    receipt.write_text(expected + "\n", encoding="ascii")
+    return output
+
+
+def texture_patch_summary(pack: Path) -> dict[str, str]:
+    """The manifest fields the import bundle records about a texture pack."""
+    with zipfile.ZipFile(pack) as archive:
+        raw = archive.read("manifest.json")
+    manifest = json.loads(raw)
+    if manifest.get("contract") != TEXTURE_PATCH_CONTRACT:
+        fail(f"texture pack contract {manifest.get('contract')} is not {TEXTURE_PATCH_CONTRACT}")
+    resident = int(manifest.get("androidResidentBytes", 0))
+    etc2 = int(manifest.get("etc2Bytes", 0))
+    return {
+        "textureFormat": "etc2",
+        "texturePatchContract": TEXTURE_PATCH_CONTRACT,
+        "textureEncoder": str(manifest.get("encoder", "")),
+        "textureConvertedCount": str(manifest.get("textureCount", 0)),
+        "textureSourceFormats": ",".join(f"{k}:{v}" for k, v in sorted(manifest.get("sourceFormats", {}).items())),
+        "textureSkipped": ",".join(f"{k}:{v}" for k, v in sorted(manifest.get("skipped", {}).items())) or "none",
+        "textureRgba32FallbackBytes": str(resident),
+        "textureEtc2Bytes": str(etc2),
+        "textureTheoreticalSavingBytes": str(max(0, resident - etc2)),
+        "textureManifestSha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
 def texture_report(repo: Path, data: Path, output_dir: Path, scan_payloads: bool = True) -> Path:
     """Read-only: every Texture2D in the depot, its format and what it costs on Android.
 
@@ -772,14 +846,20 @@ def write_bundle(
     depot_digest: str,
     payloads: dict[str, Path],
     graphics_api: str = "vulkan",
+    texture_fields: dict[str, str] | None = None,
 ) -> Path:
     manifest = {
         "format": "1", "package": PACKAGE, "unityVersion": UNITY_VERSION,
         "pcBuildContract": PC_BUILD_CONTRACT,
         "graphicsApi": graphics_api,
+        "textureFormat": "native",
         "launcherSignature": signature, "depotFingerprint": depot_digest,
         "versionName": version, "createdUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    if texture_fields:
+        manifest.update(texture_fields)
+        if "texture-patches.zip" not in payloads:
+            fail("an ETC2 build must carry texture-patches.zip")
     for name, path in payloads.items():
         key = name.replace("-", "_")
         manifest[f"{key}.size"] = str(path.stat().st_size)
@@ -788,6 +868,8 @@ def write_bundle(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     flavor = "-OpenGLES3" if graphics_api == "gles3" else ""
+    if manifest["textureFormat"] == "etc2":
+        flavor += "-ETC2"
     final = output_dir / f"SilksongAndroid-{version}{flavor}-PC-Build.zip"
     part = output_dir / (final.name + ".part")
     part.unlink(missing_ok=True)
@@ -859,6 +941,10 @@ def main() -> int:
     parser.add_argument("--key-alias")
     parser.add_argument("--graphics-api", choices=tuple(GRAPHICS_APIS), default="vulkan")
     parser.add_argument(
+        "--texture-format", choices=TEXTURE_FORMATS, default="native",
+        help="etc2: re-encode the depot's DXT textures as same-size ETC2 (opt-in; needs the device to apply the pack)",
+    )
+    parser.add_argument(
         "--texture-report", action="store_true",
         help="only write <output>/texture-report.json for the depot; builds nothing",
     )
@@ -899,7 +985,8 @@ def main() -> int:
     asm = stage_assemblies(unity, data, packages, root)
     _, converted = convert(repo, unity, root, asm, args.jobs)
     libil2cpp = compile_native(repo, unity, root, args.jobs)
-    data_apk = build_player_image(repo, unity, data, root, converted, asm, args.graphics_api)
+    texture_patches = build_texture_patches(repo, data, root) if args.texture_format == "etc2" else None
+    data_apk = build_player_image(repo, unity, data, root, converted, asm, args.graphics_api, texture_patches)
     classes = dex_player(unity, root)
     libunity = find_android_file(unity / "android", "Variations/il2cpp/Release/Libs/arm64-v8a/libunity.so")
     libmain = find_android_file(unity / "android", "Variations/il2cpp/Release/Libs/arm64-v8a/libmain.so")
@@ -914,9 +1001,13 @@ def main() -> int:
     }
     if args.graphics_api == "gles3":
         payloads["gles-shaders.zip"] = build_gles_shader_patches(repo, data, root)
+    texture_fields = None
+    if texture_patches is not None:
+        payloads["texture-patches.zip"] = texture_patches
+        texture_fields = texture_patch_summary(texture_patches)
     bundle = write_bundle(
         args.output.resolve(), version, signature, depot_fingerprint(data), payloads,
-        args.graphics_api,
+        args.graphics_api, texture_fields,
     )
     sign_bundle(bundle, args.keystore.resolve(), args.storepass, args.keypass, args.key_alias)
     verify_bundle_payloads(bundle, payloads)
@@ -928,6 +1019,19 @@ def main() -> int:
     note("complete")
     note(f"APK:    {args.output.resolve() / apk.name}")
     note(f"Bundle: {bundle}")
+    note(f"Graphics: {args.graphics_api}; textures: {args.texture_format}")
+    if texture_fields is not None:
+        mib = 1024 * 1024
+        note(
+            f"Textures: {texture_fields['textureConvertedCount']} DXT texture(s) re-encoded as ETC2 "
+            f"({texture_fields['textureSourceFormats']}); skipped {texture_fields['textureSkipped']}"
+        )
+        note(
+            f"Textures: RGBA32 fallback {int(texture_fields['textureRgba32FallbackBytes']) // mib} MiB -> "
+            f"ETC2 {int(texture_fields['textureEtc2Bytes']) // mib} MiB, theoretical saving "
+            f"{int(texture_fields['textureTheoreticalSavingBytes']) // mib} MiB (whole depot, not one scene)"
+        )
+        note(f"Textures: encoder {texture_fields['textureEncoder']}, manifest sha256 {texture_fields['textureManifestSha256']}")
     note("Install that APK, keep the Linux depot on the device, then choose Import PC build.")
     return 0
 

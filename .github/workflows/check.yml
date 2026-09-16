@@ -129,3 +129,21 @@ jobs:
             -e RUN_TESTS=1 \
             silksong-pc-builder:check apk
           sudo chown -R "$(id -u):$(id -g)" .ci-cache build
+
+      # The player module is on disk now, and Unity's own default resources
+      # file is a real serialized file with real textures: the walker and the
+      # in-place texture patch are exercised against it. Nothing game-derived
+      # is involved.
+      - name: Verify texture tools against Unity's default resources
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/amd64 \
+            --entrypoint /bin/bash \
+            --workdir /workspace \
+            -v "$PWD:/workspace" \
+            -v "$PWD/.ci-cache/unity-player:/opt/unity-player" \
+            -e "SILKSONG_TEXTURE_FIXTURE=/opt/unity-player/android/Data/Resources/unity default resources" \
+            silksong-pc-builder:check -lc \
+            'dotnet run -c Release --project tools/bundle-surgery/tests/BundleSurgery.Tests.csproj | tee /tmp/tests.log; \
+             grep -q "PASS apply and verify on a real serialized file" /tmp/tests.log'
+          sudo chown -R "$(id -u):$(id -g)" .ci-cache build tools/bundle-surgery

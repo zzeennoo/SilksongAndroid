@@ -13,6 +13,13 @@ param(
     [ValidateSet("Vulkan", "OpenGLES3")]
     [string]$GraphicsApi = "Vulkan",
 
+    # ETC2 re-encodes the depot's DXT textures as same-size ETC2 on the PC and
+    # ships the result as a patch pack the device applies while it retargets.
+    # Opt-in; Native leaves every texture as the depot has it.
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("Native", "ETC2")]
+    [string]$TextureFormat = "Native",
+
     [Parameter(Mandatory = $false)]
     [switch]$ValidatePathsOnly,
 
@@ -75,6 +82,7 @@ if ($TextureReport) {
     Write-Host "  Mode:        texture report only (read-only, no build)"
 } else {
     Write-Host "  Graphics:    $GraphicsApi"
+    Write-Host "  Textures:    $TextureFormat"
     if ($Jobs -gt 0) { Write-Host "  Jobs:        $Jobs" }
     else { Write-Host "  Jobs:        automatic (memory-safe)" }
 }
@@ -118,6 +126,9 @@ if ($TextureReport) {
 }
 if ($GraphicsApi -eq "OpenGLES3") {
     $DockerArgs += @("--env", "PC_GRAPHICS_API=gles3")
+}
+if ($TextureFormat -eq "ETC2") {
+    $DockerArgs += @("--env", "PC_TEXTURE_FORMAT=etc2")
 }
 if ($Jobs -gt 0) {
     $DockerArgs += @("--env", "PC_BUILD_JOBS=$Jobs")
