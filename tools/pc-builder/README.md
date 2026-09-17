@@ -68,10 +68,12 @@ can re-encode them into ETC2, which every Android GPU samples natively:
 `OpenGLES3`). The conversion is same-size by construction: DXT1 becomes
 ETC2_RGB, or ETC2_RGBA1 where the payload uses one-bit transparency, and DXT5
 becomes ETC2_RGBA8, each 8 or 16 bytes per 4x4 block like the format it
-replaces. No offset, stream size or `m_CompleteImageSize` changes; only
-`m_TextureFormat` and the payload bytes do. Crunched formats, BC4/BC5/BC7,
+replaces, and BC7 becomes ETC2_RGBA8 likewise. No offset, stream size or `m_CompleteImageSize` changes; only
+`m_TextureFormat` and the payload bytes do. Crunched formats, BC4/BC5/BC6H,
 cubemaps, arrays and any texture whose payload size does not match its
-dimensions are left as they are and counted in the build's summary.
+dimensions are left as they are and counted in the build's summary. BC7,
+which the texture report showed to be the depot's atlas format, is 16 bytes
+per block like DXT5 and takes the same ETC2_RGBA8 path.
 
 The PC applies the player image's own textures directly and ships the
 Addressables textures as `texture-patches.zip` inside the PC build, which the

@@ -40,7 +40,7 @@ object PcBuildImport {
     // Must match TextureTranscode.Contract in bundle-surgery, which is what
     // applies the pack; a pack from another revision is refused here rather
     // than by the retarget half an hour in.
-    const val TEXTURE_PATCH_CONTRACT = "dxt-to-etc2-same-size-v1/silksong-etc2-1"
+    const val TEXTURE_PATCH_CONTRACT = "dxt-bc7-to-etc2-same-size-v2/silksong-etc2-1"
     private val DIGEST = Regex("[0-9a-f]{64}")
 
     private data class Payload(

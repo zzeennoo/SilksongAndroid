@@ -2,7 +2,7 @@
 // a patch pack and applied in place.
 //
 //   build-texture-patches <root> <out.zip>      PC: encode every convertible
-//                                               DXT1/DXT5 Texture2D under <root>
+//                                               DXT1/DXT5/BC7 Texture2D under <root>
 //   audit-texture-patches <zip>                 prove a pack is whole and consistent
 //   apply-texture-patches <root> <zip>          apply to serialized files under <root>
 //                                               in place (the PC's player image)
@@ -16,7 +16,7 @@
 //
 // What makes the swap safe is that it is the same size. A DXT1 mip chain and
 // an ETC2_RGB (or ETC2_RGBA1) chain of the same dimensions are byte-for-byte
-// the same length, and DXT5 and ETC2_RGBA8 likewise, so the only fields that
+// the same length, and DXT5, BC7 and ETC2_RGBA8 likewise, so the only fields that
 // change are m_TextureFormat and the payload bytes themselves: no offset in a
 // .resS moves, no m_StreamData.size changes, no m_CompleteImageSize changes,
 // no other asset's position shifts. That is asserted at build time (the
@@ -26,10 +26,10 @@
 // format and payload digest compared with the manifest. Any mismatch fails
 // the whole file rather than leaving a texture half converted.
 //
-// Only what the report calls convertible is touched: DXT1 and DXT5, 2D, one
-// image, payload located and of the size its dimensions imply. Crunched
-// formats, BC4/BC5/BC6H/BC7, cubemaps, arrays and anything whose layout is
-// not understood are left as they are and counted in the summary.
+// Only what the report calls convertible is touched: DXT1, DXT5 and BC7, 2D,
+// one image, payload located and of the size its dimensions imply. Crunched
+// formats, BC4/BC5/BC6H, cubemaps, arrays and anything whose layout is not
+// understood are left as they are and counted in the summary.
 
 using AssetsTools.NET;
 using AssetsTools.NET.Extra;
@@ -83,7 +83,9 @@ internal static class TextureTranscode
     // Part of the cache key on the PC and of the signed manifest. The
     // encoder version is inside it because a different encoder produces
     // different bytes for the same texture.
-    internal const string Contract = "dxt-to-etc2-same-size-v1/" + Etc2.EncoderVersion;
+    // v2: BC7 joined the same-size set (it is 16 bytes a block like
+    // ETC2_RGBA8). A v1 pack converted DXT only and is refused.
+    internal const string Contract = "dxt-bc7-to-etc2-same-size-v2/" + Etc2.EncoderVersion;
 
     static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -238,7 +240,9 @@ internal static class TextureTranscode
             int w = TextureFormats.MipDimension(entry.Width, level), h = TextureFormats.MipDimension(entry.Height, level);
             int size = checked((int)TextureFormats.LevelSize(source, w, h));
             if (at + size > payload.Length) throw new InvalidDataException($"level {level} runs past the payload");
-            var rgba = Dxt.DecodeLevel(source, payload.AsSpan(at, size), w, h);
+            var rgba = source.Family == TextureFamily.Bc7
+                ? Bc7.DecodeLevel(payload.AsSpan(at, size), w, h)
+                : Dxt.DecodeLevel(source, payload.AsSpan(at, size), w, h);
             var encoded = Etc2.EncodeLevel(target, rgba, w, h);
             if (encoded.Length != size) throw new InvalidDataException($"level {level}: {encoded.Length} bytes for {size}");
             encoded.CopyTo(output, at);
