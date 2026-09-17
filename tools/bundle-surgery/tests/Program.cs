@@ -43,6 +43,12 @@ internal static class Program
             ("patch pack round trip, audit and tamper detection", PackRoundTrip),
             ("resource range patching leaves every other byte alone", RangePatch),
             ("apply and verify on a real serialized file (optional)", ApplySerialized),
+            ("BC7 mode 6 solid block decodes to its endpoint", Bc7Solid),
+            ("BC7 mode 5 rotation moves alpha into a colour channel", Bc7Rotation),
+            ("BC7 reserved mode decodes to transparent black", Bc7Reserved),
+            ("BC7 level decode clips and rejects short payloads", Bc7Level),
+            ("BC7 to ETC2_RGBA8 keeps the chain length", Bc7Transcode),
+            ("BC7 random-block dump for an external decoder (optional)", Bc7Dump),
         };
         int failed = 0;
         foreach (var (name, run) in tests)
@@ -157,7 +163,9 @@ internal static class Program
         Eq(TextureFormats.ETC2_RGBA1, TextureFormats.SameSizeEtc2Target(Dxt1, true)!.Id, "punch-through DXT1");
         Eq(TextureFormats.ETC2_RGBA8, TextureFormats.SameSizeEtc2Target(Dxt5, false)!.Id, "DXT5");
         Eq(TextureFormats.ETC2_RGBA8, TextureFormats.SameSizeEtc2Target(Dxt5, true)!.Id, "DXT5 ignores the flag");
-        True(TextureFormats.SameSizeEtc2Target(TextureFormats.Describe(TextureFormats.BC7), false) == null, "BC7 has no same-size target");
+        Eq(TextureFormats.ETC2_RGBA8, TextureFormats.SameSizeEtc2Target(TextureFormats.Describe(TextureFormats.BC7), false)!.Id, "BC7 is 16 bytes a block, like ETC2_RGBA8");
+        True(TextureFormats.SameSizeEtc2Target(TextureFormats.Describe(TextureFormats.BC6H), false) == null, "BC6H has no same-size target");
+        True(TextureFormats.SameSizeEtc2Target(TextureFormats.Describe(TextureFormats.BC5), false) == null, "BC5 has no same-size target");
         True(TextureFormats.SameSizeEtc2Target(TextureFormats.Describe(TextureFormats.DXT5Crunched), false) == null, "crunched has no same-size target");
         True(TextureFormats.SameSizeEtc2Target(TextureFormats.Describe(TextureFormats.RGBA32), false) == null, "uncompressed has no target");
     }
@@ -217,7 +225,8 @@ internal static class Program
         Eq("dimension-3", TextureFormats.ConversionBlocker(Dxt5, 3, 1), "3D");
         Eq("dimension-4", TextureFormats.ConversionBlocker(Dxt5, 4, 6), "cube");
         Eq("image-count", TextureFormats.ConversionBlocker(Dxt5, 2, 6), "six images");
-        Eq("bc6h-bc7", TextureFormats.ConversionBlocker(TextureFormats.Describe(TextureFormats.BC7), 2, 1), "BC7");
+        Eq(null, TextureFormats.ConversionBlocker(TextureFormats.Describe(TextureFormats.BC7), 2, 1), "BC7 2D");
+        Eq("bc6h", TextureFormats.ConversionBlocker(TextureFormats.Describe(TextureFormats.BC6H), 2, 1), "BC6H");
         Eq("bc4-bc5-channel-packed", TextureFormats.ConversionBlocker(TextureFormats.Describe(TextureFormats.BC5), 2, 1), "BC5");
         Eq("not-desktop-only", TextureFormats.ConversionBlocker(Etc2Rgba8, 2, 1), "already ETC2");
     }
@@ -394,19 +403,20 @@ internal static class Program
         var d = TextureReport.Summarize(entries, "/root", payloadsScanned: false);
         Eq(7, d.Totals.Textures, "count");
         Eq(5, d.Totals.DesktopOnlyTextures, "desktop-only: two DXT5, DXT1, BC7, crunched");
-        Eq(2, d.Totals.Convertible, "DXT5 + DXT1");
-        Eq(5, d.Totals.Blocked, "bc7, crunched, native, short, empty");
+        Eq(3, d.Totals.Convertible, "DXT5 + DXT1 + BC7");
+        Eq(4, d.Totals.Blocked, "crunched, native, short, empty");
         Eq(0, d.Totals.PayloadUnreadable, "an empty texture is not an unlocated payload");
-        Eq(1, d.Blockers["bc6h-bc7"], "bc7 blocker");
+        True(!d.Blockers.ContainsKey("bc6h-bc7") && !d.Blockers.ContainsKey("bc6h"), "BC7 is not blocked");
         Eq(1, d.Blockers["crunched"], "crunched blocker");
         Eq(2, d.Blockers["not-desktop-only"], "native and empty blockers");
         Eq(1, d.Blockers["payload-size-mismatch"], "short blocker");
         Eq(1, d.Totals.PayloadMismatches, "mismatch counted");
         long atlasA = 64L * 1024 * 1024 - 16L * 1024 * 1024;
         long atlasB = 4L * 1024 * 1024 - 512L * 1024;
-        Eq(atlasA + atlasB, d.Totals.EstimatedSavingBytes, "saving over convertible only");
-        Eq(16L * 1024 * 1024 + 512L * 1024, d.Totals.Etc2Bytes, "etc2 bytes over convertible only");
-        True(d.Totals.BlockedSavingBytes >= 512L * 512 * 4 - 512L * 512, "bc7 saving counted as blocked");
+        long bc7 = 512L * 512 * 4 - 512L * 512;
+        Eq(atlasA + atlasB + bc7, d.Totals.EstimatedSavingBytes, "saving over convertible only");
+        Eq(16L * 1024 * 1024 + 512L * 1024 + 512L * 512, d.Totals.Etc2Bytes, "etc2 bytes over convertible only");
+        True(d.Totals.BlockedSavingBytes >= 256L * 256 * 4 - 256L * 256, "crunched saving counted as blocked");
         var dxt5 = d.ByFormat.Single(s => s.FormatId == TextureFormats.DXT5);
         Eq(2, dxt5.Count, "two DXT5"); Eq(1, dxt5.Convertible, "one convertible DXT5"); Eq(1, dxt5.Blocked, "one blocked DXT5");
         Eq(TextureFormats.DXT5, d.ByFormat[0].FormatId, "largest format first");
@@ -855,5 +865,135 @@ internal static class Program
             Console.WriteLine($"      applied to {target.Name} ({target.Format} {target.Width}x{target.Height}, {src.Length} bytes)");
         }
         finally { Directory.Delete(dir, recursive: true); }
+    }
+
+    // ── BC7 ─────────────────────────────────────────────────────────────────
+
+    sealed class BitWriter
+    {
+        public readonly byte[] Bytes = new byte[16];
+        int _at;
+        public void Write(int value, int bits)
+        {
+            for (int i = 0; i < bits; i++)
+            {
+                if (((value >> i) & 1) != 0) Bytes[_at >> 3] |= (byte)(1 << (_at & 7));
+                _at++;
+            }
+        }
+    }
+
+    static void Bc7Solid()
+    {
+        // Mode 6: 7-bit endpoints + p-bit, 4-bit indices. Both endpoints the
+        // same, p = 1: colour 0x55 -> 0xAB, alpha 0x7F -> 0xFF.
+        var w = new BitWriter();
+        w.Write(1 << 6, 7);                 // six zeros then a one
+        for (int e = 0; e < 2; e++) w.Write(0x55, 7); // R0 R1
+        for (int e = 0; e < 2; e++) w.Write(0x2A, 7); // G0 G1 -> 0x55
+        for (int e = 0; e < 2; e++) w.Write(0x00, 7); // B0 B1 -> 0x01
+        for (int e = 0; e < 2; e++) w.Write(0x7F, 7); // A0 A1 -> 0xFF
+        w.Write(1, 1); w.Write(1, 1);       // p-bits
+        w.Write(0, 3); for (int p = 1; p < 16; p++) w.Write(0, 4);
+        var rgba = new byte[64];
+        Bc7.DecodeBlock(w.Bytes, rgba);
+        for (int p = 0; p < 16; p++)
+        {
+            Eq((byte)0xAB, rgba[p * 4], $"r {p}"); Eq((byte)0x55, rgba[p * 4 + 1], $"g {p}");
+            Eq((byte)0x01, rgba[p * 4 + 2], $"b {p}"); Eq((byte)0xFF, rgba[p * 4 + 3], $"a {p}");
+        }
+        // Indices at the far endpoint select endpoint 1: make R1 differ.
+        var w2 = new BitWriter();
+        w2.Write(1 << 6, 7);
+        w2.Write(0x00, 7); w2.Write(0x7F, 7);   // R0 = 0, R1 = 0xFF (with p)
+        w2.Write(0, 7); w2.Write(0, 7); w2.Write(0, 7); w2.Write(0, 7);
+        w2.Write(0x7F, 7); w2.Write(0x7F, 7);
+        w2.Write(1, 1); w2.Write(1, 1);
+        w2.Write(0, 3);                          // pixel 0 -> endpoint 0
+        for (int p = 1; p < 16; p++) w2.Write(15, 4); // the rest -> endpoint 1
+        Bc7.DecodeBlock(w2.Bytes, rgba);
+        Eq((byte)1, rgba[0], "pixel 0 red at e0 (p-bit)");
+        Eq((byte)255, rgba[4], "pixel 1 red at e1");
+        // Weight 8 of 15: (64-34)*1 + 34*255 + 32 >> 6 = 136.
+        var w3 = new BitWriter();
+        w3.Write(1 << 6, 7);
+        w3.Write(0x00, 7); w3.Write(0x7F, 7);
+        w3.Write(0, 7); w3.Write(0, 7); w3.Write(0, 7); w3.Write(0, 7);
+        w3.Write(0x7F, 7); w3.Write(0x7F, 7);
+        w3.Write(1, 1); w3.Write(1, 1);
+        w3.Write(0, 3); for (int p = 1; p < 16; p++) w3.Write(8, 4);
+        Bc7.DecodeBlock(w3.Bytes, rgba);
+        Eq((byte)136, rgba[4], "interpolated red");
+    }
+
+    static void Bc7Rotation()
+    {
+        // Mode 5: rotation 1 swaps alpha and red. Endpoints: R = 0, A = 0xFF.
+        var w = new BitWriter();
+        w.Write(1 << 5, 6);      // five zeros then a one
+        w.Write(1, 2);           // rotation: A <-> R
+        w.Write(0, 7); w.Write(0, 7);        // R0 R1
+        w.Write(0x40, 7); w.Write(0x40, 7);  // G -> 0x81
+        w.Write(0, 7); w.Write(0, 7);        // B
+        w.Write(0xFF, 8); w.Write(0xFF, 8);  // A0 A1
+        w.Write(0, 1); for (int p = 1; p < 16; p++) w.Write(0, 2);   // colour indices
+        w.Write(0, 1); for (int p = 1; p < 16; p++) w.Write(0, 2);   // alpha indices
+        var rgba = new byte[64];
+        Bc7.DecodeBlock(w.Bytes, rgba);
+        Eq((byte)255, rgba[0], "red took alpha's value");
+        Eq((byte)0, rgba[3], "alpha took red's value");
+        Eq((byte)0x81, rgba[1], "green expanded from 7 bits");
+    }
+
+    static void Bc7Reserved()
+    {
+        var rgba = new byte[64];
+        Array.Fill(rgba, (byte)9);
+        Bc7.DecodeBlock(new byte[16], rgba);
+        for (int i = 0; i < 64; i++) Eq((byte)0, rgba[i], $"byte {i}");
+    }
+
+    static void Bc7Level()
+    {
+        var payload = new byte[2 * 1 * 16];
+        payload[0] = 1 << 6; // mode 6, everything else zero -> black opaque? alpha endpoints 0 -> 0
+        payload[16] = 1 << 6;
+        var rgba = Bc7.DecodeLevel(payload, 5, 3);
+        Eq(5 * 3 * 4, rgba.Length, "clipped size");
+        bool threw = false;
+        try { Bc7.DecodeLevel(new byte[16], 8, 4); } catch (InvalidDataException) { threw = true; }
+        True(threw, "8x4 needs 32 bytes");
+    }
+
+    static void Bc7Transcode()
+    {
+        var rng = new Random(17);
+        int w = 24, h = 40, mips = 4;
+        var bc7 = TextureFormats.Describe(TextureFormats.BC7);
+        var payload = new byte[TextureFormats.ChainSize(bc7, w, h, mips)];
+        rng.NextBytes(payload);
+        var entry = Entry("bc7", TextureFormats.BC7, w, h, mips, payload: payload.Length);
+        entry.SuggestedTargetId = TextureFormats.SameSizeEtc2Target(bc7, false)!.Id;
+        Eq(TextureFormats.ETC2_RGBA8, entry.SuggestedTargetId!.Value, "target");
+        Eq(null, entry.ConversionBlocker, "convertible");
+        var etc = TextureTranscode.Transcode(entry, payload);
+        Eq(payload.Length, etc.Length, "same length");
+        var back = Etc2.DecodeLevel(TextureFormats.ETC2_RGBA8, etc.AsSpan(0, (int)TextureFormats.LevelSize(Etc2Rgba8, w, h)), w, h);
+        Eq(w * h * 4, back.Length, "level 0 decodes");
+    }
+
+    static void Bc7Dump()
+    {
+        string? dir = Environment.GetEnvironmentVariable("SILKSONG_BC7_DUMP");
+        if (string.IsNullOrWhiteSpace(dir)) throw new SkipException("SILKSONG_BC7_DUMP not set");
+        Directory.CreateDirectory(dir);
+        // 256x256 of random blocks: 4096 blocks across every mode, partition,
+        // rotation and index pattern. Reserved-mode blocks included.
+        int w = 256, h = 256;
+        var payload = new byte[w * h];
+        new Random(99).NextBytes(payload);
+        File.WriteAllBytes(Path.Combine(dir, "bc7.bin"), payload);
+        File.WriteAllBytes(Path.Combine(dir, "bc7-decoded.rgba"), Bc7.DecodeLevel(payload, w, h));
+        File.WriteAllText(Path.Combine(dir, "dims.txt"), $"{w} {h}\n");
     }
 }

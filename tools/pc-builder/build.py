@@ -38,7 +38,7 @@ GLES_PATCH_CONTRACT = "spirv-cross-be71ee8-essl310-v1"
 TEXTURE_FORMATS = ("native", "etc2")
 # Must match TextureTranscode.Contract in bundle-surgery: the same-size
 # DXT -> ETC2 rule and the encoder revision that produced the bytes.
-TEXTURE_PATCH_CONTRACT = "dxt-to-etc2-same-size-v1/silksong-etc2-1"
+TEXTURE_PATCH_CONTRACT = "dxt-bc7-to-etc2-same-size-v2/silksong-etc2-1"
 ROSLYN_VERSION = "4.12.0"
 ROSLYN_BYTES = 21_775_071
 ROSLYN_FILES = (

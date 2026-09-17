@@ -298,12 +298,15 @@ internal static class TextureFormats
     /// same-size mapping exists. DXT1 payloads that use the punch-through
     /// mode become ETC2_RGBA1 so that the transparent texels stay
     /// transparent; the rest become plain ETC2_RGB. Both are 8 bytes a block.
+    /// DXT5 and BC7 are 16 bytes a block, as is ETC2_RGBA8. BC7 loses some
+    /// fidelity in the swap (it is the better codec at the same size) but
+    /// keeps its full alpha channel.
     /// </summary>
     public static TextureFormatInfo? SameSizeEtc2Target(TextureFormatInfo source, bool dxt1UsesPunchThrough) =>
         source.Family switch
         {
             TextureFamily.Dxt1 => Describe(dxt1UsesPunchThrough ? ETC2_RGBA1 : ETC2_RGB),
-            TextureFamily.Dxt5 => Describe(ETC2_RGBA8),
+            TextureFamily.Dxt5 or TextureFamily.Bc7 => Describe(ETC2_RGBA8),
             _ => null,
         };
 
@@ -318,10 +321,10 @@ internal static class TextureFormats
         if (imageCount != 1) return "image-count";
         return f.Family switch
         {
-            TextureFamily.Dxt1 or TextureFamily.Dxt5 => null,
+            TextureFamily.Dxt1 or TextureFamily.Dxt5 or TextureFamily.Bc7 => null,
             TextureFamily.Dxt1Crunched or TextureFamily.Dxt5Crunched => "crunched",
             TextureFamily.Bc4 or TextureFamily.Bc5 => "bc4-bc5-channel-packed",
-            TextureFamily.Bc6h or TextureFamily.Bc7 => "bc6h-bc7",
+            TextureFamily.Bc6h => "bc6h",
             _ => "not-desktop-only",
         };
     }
