@@ -205,12 +205,27 @@ hash=$(sha256sum "$f" | cut -d' ' -f1)
 part="$out.part.$$"
 stamp="$out.sha256"
 stamp_part="$stamp.part.$$"
-rm -f "$part" "$stamp_part"
+errs="$part.err"
+rm -f "$part" "$stamp_part" "$errs"
 if ! $CLANG -x "$CC_LANG" -std="$CC_STD" $CC_PCH $CXXFLAGS $DEF $INC $TGT \
-     -c "$f" -o "$part" 2>>err.log; then
-    rm -f "$part" "$stamp_part"
-    exit 1
+     -c "$f" -o "$part" 2>"$errs"; then
+    # A precompiled header clang will not accept is an optimisation that has
+    # gone stale, not a reason to lose the build: compile this unit without
+    # it. The PCH identity check below is meant to prevent this; the retry
+    # is for whatever that check did not foresee.
+    if [ -n "$CC_PCH" ] && grep -q 'precompiled header' "$errs"; then
+        echo "### PCH rejected for $rel; compiling without it" >>"$errs"
+        cat "$errs" >>err.log
+        rm -f "$errs"
+        $CLANG -x "$CC_LANG" -std="$CC_STD" $CXXFLAGS $DEF $INC $TGT \
+            -c "$f" -o "$part" 2>>err.log || { rm -f "$part" "$stamp_part"; exit 1; }
+    else
+        cat "$errs" >>err.log
+        rm -f "$part" "$stamp_part" "$errs"
+        exit 1
+    fi
 fi
+[ -f "$errs" ] && cat "$errs" >>err.log && rm -f "$errs"
 mv -f "$part" "$out" || exit 1
 printf '%s' "$hash" > "$stamp_part" || exit 1
 mv -f "$stamp_part" "$stamp" || exit 1
@@ -233,21 +248,62 @@ export CLANG CXXFLAGS DEF INC TGT
 #
 # A failure here is not fatal. The PCH is an optimisation, and a build that is
 # slower is better than a build that does not happen.
+# What a precompiled header was built against.
+#
+# Clang validates a PCH against the modification time of every header it
+# pulled in, and refuses it when any differs -- "has been modified since the
+# precompiled header was built". On the PC that happened without anything
+# changing: the Docker image is rebuilt on every run, a rebuilt layer
+# re-extracts the NDK with fresh mtimes, and the PCH in the build volume was
+# from the previous image. Every translation unit then failed, and the
+# twenty-minute build with it.
+#
+# So the PCH carries a stamp of what it was built with -- the compiler, the
+# sysroot, and the mtime and size of one header from each tree it includes --
+# and is rebuilt when that stamp changes. The mtime-based test on the pch
+# header alone missed this because the header that moved was the sysroot's.
+# It is a cheap check (three stats) against an expensive failure.
+#
+# stat -c is toybox and coreutils; a system without it gets an empty stamp,
+# which rebuilds the PCH every run: ten seconds, and always correct.
+pch_identity() {
+    hdr="$1"
+    printf '%s|%s|%s|%s|%s\n' \
+        "$($CLANG --version 2>/dev/null | head -1)" \
+        "$SYSROOT" \
+        "$(stat -c '%Y:%s' "$SYSROOT/usr/include/c++/v1/string.h" 2>/dev/null)" \
+        "$(stat -c '%Y:%s' "$hdr" 2>/dev/null)" \
+        "$(stat -c '%Y:%s' "$LIBIL2CPP/il2cpp-config.h" 2>/dev/null)"
+}
+
+# And validated by content, not mtime, when clang is asked to use it: a
+# header whose timestamp moved but whose bytes did not is accepted. The
+# flag has to be given when the PCH is made (it stores the hashes) and when
+# it is used. It lives outside CXXFLAGS on purpose: the flag signature above
+# wipes every object when it changes, and the objects are not affected.
+PCHFLAGS="-fpch-validate-input-files-content"
+
 build_pch() {
     hdr="$1"; lang="$2"; std="$3"; out="$4"
     [ -f "$hdr" ] || return 1
-    # Rebuilt when the header is newer, so a re-fetched or updated Unity does
-    # not leave a stale one behind. A flag change is already covered: that
-    # wipes obj/ wholesale via the signature check above, and the PCH with it.
-    [ -s "$out" ] && [ ! "$hdr" -nt "$out" ] && return 0
+    identity=$(pch_identity "$hdr")
+    if [ -s "$out" ] && [ -f "$out.identity" ] && [ -n "$identity" ] && \
+       [ "$(cat "$out.identity")" = "$identity" ]; then
+        return 0
+    fi
+    # To stderr: pch_for's stdout is the flag string the compiles receive.
+    [ -s "$out" ] && echo "### rebuilding $(basename "$out"): toolchain or headers changed since it was built" >&2
     part="$out.part"
-    rm -f "$part"
-    if ! $CLANG -x "$lang-header" -std="$std" $CXXFLAGS $DEF $INC $TGT \
+    rm -f "$part" "$out.identity"
+    if ! $CLANG -x "$lang-header" -std="$std" $PCHFLAGS $CXXFLAGS $DEF $INC $TGT \
         -o "$part" "$hdr" 2>>err.log; then
         rm -f "$part"
         return 1
     fi
-    mv -f "$part" "$out"
+    mv -f "$part" "$out" || return 1
+    # Written after the PCH, so an interrupted build leaves no stamp and the
+    # next run rebuilds rather than trusts.
+    printf '%s' "$identity" > "$out.identity"
 }
 
 pch_for() {
@@ -261,7 +317,7 @@ pch_for() {
         # as "no such file or directory: '-march=armv8-a'" -- and the phase
         # that passed no PCH at all compiled perfectly, which is what made it
         # look like a PCH problem rather than a quoting one.
-        printf '%s %s' -include-pch "$out"
+        printf '%s %s %s' -include-pch "$out" "$PCHFLAGS"
     else
         echo "### PCH unavailable for $lang, compiling without one" >&2
         printf ''

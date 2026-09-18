@@ -752,6 +752,115 @@ class PcBuilderTests(unittest.TestCase):
         self.assertIn('-TextureFormat %TEX%', cmd)
         self.assertIn('set "TEX=ETC2"', cmd)
 
+    # ── the native build script, driven with a stub clang ────────────────────
+
+    STUB_CLANG = r'''#!/bin/bash
+# A clang that emulates the two behaviours the build script depends on:
+# it writes whatever -o names, and it refuses a precompiled header whose
+# recorded sysroot header mtime is not the current one, with clang's words.
+out=""; lang=""; pch=""
+args=("$@")
+for ((i=0; i<${#args[@]}; i++)); do
+  case "${args[$i]}" in
+    -o) out="${args[$((i+1))]}";;
+    -x) lang="${args[$((i+1))]}";;
+    -include-pch) pch="${args[$((i+1))]}";;
+    --version) echo "stub clang version 18.0.0"; exit 0;;
+  esac
+done
+sysroot_header=$(ls -d "$SILKSONG_STUB_SYSROOT"/usr/include/c++/v1/string.h)
+now=$(stat -c %Y "$sysroot_header")
+if [[ "$lang" == *-header ]]; then printf '%s' "$now" > "$out"; exit 0; fi
+if [[ -n "$pch" ]] && [[ "$(cat "$pch")" != "$now" ]]; then
+  echo "fatal error: file 'string.h' has been modified since the precompiled header '$pch' was built" >&2
+  exit 1
+fi
+[[ -n "$out" ]] && printf 'obj' > "$out"
+exit 0
+'''
+
+    def _native_fixture(self, root: Path) -> dict[str, str]:
+        usr = root / "usr/bin"; usr.mkdir(parents=True)
+        (root / "usr/lib").mkdir()
+        for name in ("clang", "clang++"):
+            (usr / name).write_text(self.STUB_CLANG, encoding="utf-8")
+            (usr / name).chmod(0o755)
+        sysroot = root / "sysroot"
+        (sysroot / "usr/include/c++/v1").mkdir(parents=True)
+        (sysroot / "usr/include/c++/v1/string.h").write_text("// string\n")
+        il2cpp = root / "libil2cpp"
+        (il2cpp / "pch").mkdir(parents=True)
+        (il2cpp / "pch/pch-cpp.hpp").write_text("// pch\n")
+        (il2cpp / "pch/pch-c.h").write_text("// pch c\n")
+        (il2cpp / "il2cpp-config.h").write_text("// config\n")
+        (il2cpp / "os/ClassLibraryPAL/brotli/include").mkdir(parents=True)
+        (il2cpp / "os/ClassLibraryPAL/brotli/dec.c").write_text("int b;\n")
+        (il2cpp / "runtime.cpp").write_text("int r;\n")
+        external = root / "external"
+        (external / "bdwgc/extra").mkdir(parents=True)
+        (external / "bdwgc/include").mkdir()
+        (external / "bdwgc/libatomic_ops/src").mkdir(parents=True)
+        (external / "bdwgc/extra/gc.c").write_text("int g;\n")
+        (external / "zlib").mkdir()
+        (external / "zlib/adler.c").write_text("int z;\n")
+        (external / "baselib/Include").mkdir(parents=True)
+        (external / "baselib/Platforms/Android/Include").mkdir(parents=True)
+        (root / "baselib.a").write_bytes(b"!<arch>\n")
+        cpp = root / "cpp"
+        cpp.mkdir()
+        (cpp / "Bulk_A.cpp").write_text("int a;\n")
+        (cpp / "Bulk_B.cpp").write_text("int b;\n")
+        (cpp / "Il2CppGenericMethodPointerTable.c").write_text("int c;\n")
+        return {
+            "ROOT": str(root), "USR": str(root / "usr"), "SYSROOT": str(sysroot),
+            "LIBIL2CPP": str(il2cpp), "EXTERNAL": str(external), "BASELIB": str(root / "baselib.a"),
+            "CPPDIR": str(cpp), "BUILD_JOBS": "2", "SILKSONG_STUB_SYSROOT": str(sysroot),
+            "PATH": os.environ.get("PATH", ""),
+        }
+
+    def _run_native(self, env: dict[str, str]) -> str:
+        script = REPO_ROOT / "tools/ondevice-il2cpp/build-il2cpp.sh"
+        result = subprocess.run(["bash", str(script)], cwd=env["ROOT"], env=env, capture_output=True, text=True)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        return result.stdout + result.stderr
+
+    def test_native_build_survives_a_sysroot_whose_headers_were_reextracted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = self._native_fixture(root)
+            first = self._run_native(env)
+            self.assertIn("2 rebuilt, 0 unchanged", first)
+            pch = root / "obj/pch-cpp.pch"
+            self.assertTrue(pch.is_file())
+            self.assertTrue((root / "obj/pch-cpp.pch.identity").is_file())
+            # The NDK was re-extracted: same bytes, new mtime, as a rebuilt
+            # Docker layer produces. Without the identity stamp clang rejects
+            # the PCH and every translation unit fails.
+            header = root / "sysroot/usr/include/c++/v1/string.h"
+            os.utime(header, (header.stat().st_atime + 100000, header.stat().st_mtime + 100000))
+            (root / "cpp/Bulk_A.cpp").write_text("int a2;\n")
+            second = self._run_native(env)
+            self.assertIn("rebuilding pch-cpp.pch", second)
+            self.assertIn("1 rebuilt, 1 unchanged", second)
+            # The notice must not have leaked into the compiler flags.
+            self.assertNotIn("### rebuilding", second.split("### PHASE A")[1].split("### PHASE B")[0])
+            self.assertEqual(str(int(header.stat().st_mtime)), pch.read_text())
+            self.assertNotIn("PCH rejected", (root / "err.log").read_text())
+
+    def test_native_build_compiles_without_a_pch_clang_still_rejects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = self._native_fixture(root)
+            self._run_native(env)
+            # Corrupt the PCH so clang rejects it while the identity stamp
+            # still matches: the retry path, not the rebuild path.
+            (root / "obj/pch-cpp.pch").write_text("stale")
+            (root / "cpp/Bulk_B.cpp").write_text("int b2;\n")
+            out = self._run_native(env)
+            self.assertIn("1 rebuilt, 1 unchanged", out)
+            self.assertIn("PCH rejected for Bulk_B.cpp; compiling without it", (root / "err.log").read_text())
+            self.assertTrue((root / "libil2cpp.so").is_file())
+
     def test_bundle_uses_the_importers_exact_entry_names(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
