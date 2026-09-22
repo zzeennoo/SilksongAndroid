@@ -449,6 +449,14 @@ internal static class TextureTranscode
         {
             string path = Path.Combine(root, relative.Replace('/', Path.DirectorySeparatorChar));
             if (!File.Exists(path) || relative.EndsWith(".bundle", StringComparison.Ordinal)) continue;
+            // A pack built before the engine-replaced rule still names the
+            // depot's built-in resources; the image holds the Android
+            // engine's file under that name, so there is nothing to apply.
+            if (TextureFormats.IsReplacedByEngine(relative))
+            {
+                Console.WriteLine($"  texture patches: skipping {relative}, replaced by the Android engine's own copy");
+                continue;
+            }
             files++;
             changed += ApplySerializedFile(pack, relative, path, patches, classDataPath);
         }

@@ -444,6 +444,7 @@ internal static class TextureReport
         entry.AndroidResidentBytes = resident < 0 ? -1 : resident * images;
 
         entry.ConversionBlocker = TextureFormats.ConversionBlocker(format, entry.Dimension, entry.ImageCount);
+        if (entry.ConversionBlocker == null && TextureFormats.IsReplacedByEngine(entry.File)) entry.ConversionBlocker = "engine-replaced";
         if (entry.ConversionBlocker == null && entry.DataLocation == "none") entry.ConversionBlocker = "no-payload";
         // Nothing to locate: an empty texture is complete as it is, and one
         // that should have bytes but has none is a finding, not an I/O error.
