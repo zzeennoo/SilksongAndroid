@@ -331,4 +331,15 @@ internal static class TextureFormats
 
     // UnityEngine.Rendering.TextureDimension: 2 is Tex2D.
     public const int TextureDimension2D = 2;
+
+    /// <summary>
+    /// Files the port does not ship from the depot. Both build paths replace
+    /// the Linux player's built-in resources with the Android engine's own
+    /// copy, whose textures are already ETC. A patch built from the depot's
+    /// copy can never match what ends up in the image, and the first real
+    /// build found exactly that: the apply refused path 15000 of the
+    /// Android file because it was ETC_RGB4, not the DXT the pack expected.
+    /// </summary>
+    public static bool IsReplacedByEngine(string relativePath) =>
+        relativePath.Replace('\\', '/') is "Resources/unity default resources" or "unity default resources";
 }

@@ -229,6 +229,14 @@ internal static class Program
         Eq("bc6h", TextureFormats.ConversionBlocker(TextureFormats.Describe(TextureFormats.BC6H), 2, 1), "BC6H");
         Eq("bc4-bc5-channel-packed", TextureFormats.ConversionBlocker(TextureFormats.Describe(TextureFormats.BC5), 2, 1), "BC5");
         Eq("not-desktop-only", TextureFormats.ConversionBlocker(Etc2Rgba8, 2, 1), "already ETC2");
+        True(TextureFormats.IsReplacedByEngine("Resources/unity default resources"), "engine file, forward slashes");
+        True(TextureFormats.IsReplacedByEngine("Resources\\unity default resources"), "engine file, backslashes");
+        True(!TextureFormats.IsReplacedByEngine("Resources/unity_builtin_extra"), "builtin extra ships from the depot");
+        // The report marks it, so a pack never carries it.
+        var engine = Entry("engine", TextureFormats.DXT5, 64, 64, 1);
+        engine.File = "Resources/unity default resources";
+        TextureReport.ResolvePayload(engine, null, false, _ => new TextureReport.PayloadSource(long.MaxValue, (_, _) => Array.Empty<byte>()));
+        Eq("engine-replaced", engine.ConversionBlocker, "blocked by name");
     }
 
     static byte[] Dxt1Block(ushort c0, ushort c1, uint indices)
@@ -822,13 +830,16 @@ internal static class Program
         try
         {
             string classData = Path.Combine(AppContext.BaseDirectory, "classdata.tpk");
-            string copy = Path.Combine(dir, "root", Path.GetFileName(fixture));
+            // Under a neutral name: the fixture is Unity's own default
+            // resources file, and that name is the one the apply skips.
+            const string name = "fixture.assets";
+            string copy = Path.Combine(dir, "root", name);
             File.Copy(fixture, copy);
             // Find an inline block-compressed texture to swap for same-size bytes.
             var entries = new System.Collections.Concurrent.ConcurrentBag<TextureEntry>();
             var others = new System.Collections.Concurrent.ConcurrentDictionary<string, int>();
             var payloads = new Dictionary<(string, long), byte[]>();
-            TextureReport.InspectSerialized(copy, Path.GetFileName(fixture), true, classData, entries, others, payloads);
+            TextureReport.InspectSerialized(copy, name, true, classData, entries, others, payloads);
             var target = entries.FirstOrDefault(e => e.DataLocation == "inline" && e.PayloadBytes >= 64 && e.PayloadMatchesExpected
                 && TextureFormats.Describe(e.FormatId).IsBlockCompressed);
             if (target == null) throw new SkipException("fixture has no inline block-compressed texture");
@@ -843,14 +854,14 @@ internal static class Program
                 Size = src.Length, SourceSha256 = Sha(src), BlobSha256 = Sha(blob),
             };
             var manifest = new TexturePatchManifest { FileCount = 1, TextureCount = 1 };
-            manifest.Files[Path.GetFileName(fixture)] = new List<TexturePatch> { patch };
+            manifest.Files[name] = new List<TexturePatch> { patch };
             string pack = MakePack(dir, manifest, new() { [patch.BlobSha256] = blob });
 
             Eq(0, TextureTranscode.ApplyToSerialized(Path.Combine(dir, "root"), pack, classData), "apply");
             // Parse back independently of the verifier.
             var after = new System.Collections.Concurrent.ConcurrentBag<TextureEntry>();
             var afterPayloads = new Dictionary<(string, long), byte[]>();
-            TextureReport.InspectSerialized(copy, Path.GetFileName(fixture), true, classData, after, others, afterPayloads);
+            TextureReport.InspectSerialized(copy, name, true, classData, after, others, afterPayloads);
             var changed = after.Single(e => e.PathId == target.PathId);
             Eq(targetFormat, changed.FormatId, "format flipped");
             True(afterPayloads[(target.AssetFile, target.PathId)].AsSpan().SequenceEqual(blob), "bytes swapped");
